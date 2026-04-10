@@ -510,10 +510,6 @@ Put together, Agent's Cloud is the layer that turns a voice agent that works in 
 
 # Evaluation and Iteration Loops
 
-::: {.callout-warning}
-This is the section where we have to be most honest, because it is the area with the biggest gap between what we have already built and what we should eventually have. The gap is not catastrophic — we run a reactive evaluation loop in production today — but closing it is high leverage and we should name it clearly.
-:::
-
 ## What we already run in production
 
 Every call produces a complete, structured trace:
@@ -536,25 +532,23 @@ On top of that, we run an **automated reactive evaluation loop**:
 
 This is more evaluation infrastructure than most voice AI products actually run in production. It closes the loop between "a bad call happened" and "an engineer can see the full context and act within minutes". It is also, genuinely, a product advantage: when we onboard a new merchant, we can show them the alerting dashboard on the first day.
 
-## What we have not yet built
+## The next step: proactive evaluation
 
-The reactive loop tells us when something has already gone wrong in production. The **proactive loop** — the loop that prevents regressions before they ship — has most of its pieces missing:
+The reactive loop tells us when something has gone wrong in production. The natural next step, which we have the raw data for and is near-term work, is a proactive loop that prevents regressions before they ship rather than flags them after — replaying historical calls against candidate template changes, structured A/B experimentation on production traffic, and pre-deployment regression gates on curated scenarios. A smaller related item already on the near-term list is context summarisation for long conversations, so that advisory and escalation calls do not grow the LLM context unbounded.
 
-- **Replay harness.** The ability to re-run a historical call against a new template or prompt and compare outcomes. We have the traces, transcriptions, and node histories to do this; we have not built the harness that runs them through a candidate template and scores the deltas.
-- **A/B testing infrastructure.** Split traffic between template variants, measure outcome deltas with enough statistical rigour to decide, and automatically promote winners. Our template system already supports the variants; the experiment framework around them does not exist yet.
-- **Pre-deployment regression gates.** A curated set of (scripted and real-trace-derived) scenarios that every template change must pass before shipping. Today a template change is tested manually in playground mode.
-- **Uncertainty calibration on critical slots.** For address collection, payment confirmation, OTP readback, and account details, we capture STT confidence at the token level but do not yet use it to decide "ask the customer to repeat" vs "proceed". This is the single highest-value safety improvement we could make for enterprise workflows, and it becomes mandatory as we expand into regulated financial services.
-- **Teacher trajectories.** Ideal conversation paths for each workflow family, used as a reference signal to measure how far production calls drift from the intended path. The node-traversal data we already log is the right raw material for this.
+::: {.callout-note collapse="true"}
+## Specific work items in this area
 
-## Why closing the loop is important
+- **Replay harness.** Re-run a historical call against a new template or prompt and compare outcomes. We have the traces, transcriptions, and node histories for this; the harness that runs them through a candidate template and scores the deltas is the piece to build.
+- **A/B testing infrastructure.** Split traffic between template variants, measure outcome deltas with enough statistical rigour to decide, and automatically promote winners. The template system already supports variants; the experiment framework around them is next.
+- **Pre-deployment regression gates.** A curated set of scripted and real-trace-derived scenarios that every template change passes before shipping.
+- **Uncertainty calibration on critical slots.** For address collection, payment confirmation, OTP readback, and account details, we capture STT confidence at the token level. Using it to decide "ask the customer to repeat" vs "proceed" becomes mandatory as we expand into regulated financial services.
+- **Teacher trajectories.** Ideal conversation paths per workflow family, used as a reference signal to measure how far production calls drift from the intended path. The node-traversal data we already log is the right raw material.
+:::
 
-Every production call is private, India-specific, code-mixed, accented, noisy data. It is the kind of data that cannot be bought and cannot be scraped. Without a systematic evaluation loop, it is just trace data sitting in Postgres and Langfuse. With one, every call improves the next call, and every merchant we serve makes every subsequent merchant's deployment more reliable.
+## Why this investment compounds
 
-This is the compounding part of the product. It should be invested in, deliberately and with patience. It is not the *only* thing to invest in — we need the conversational quality and runtime work to continue in parallel — but it is the thing most likely to turn today's engineering depth into a lasting advantage.
-
-## The context-summarisation gap
-
-One smaller but concrete gap worth naming: long conversations grow the LLM context unbounded. Pipecat does not ship a built-in summariser, and we have not yet written a Breeze-Buddy-specific one. For short transactional calls this is not a problem; for longer support, escalation, or advisory calls it becomes a cost and latency vector. Closing this is a modest amount of work and is already on the near-term list.
+Every production call is private, India-specific, code-mixed, accented, noisy data. It cannot be bought and cannot be scraped. Closing the proactive loop is what turns this data into a compounding moat rather than passive storage: every merchant we serve makes every subsequent merchant's deployment more reliable, and over time the feedback loop is what turns today's engineering depth into a durable advantage.
 
 ---
 
