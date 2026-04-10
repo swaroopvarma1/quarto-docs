@@ -1,0 +1,41 @@
+project:
+  type: website
+  output-dir: _site
+  render:
+    - "index.qmd"
+    - "voice-stack.qmd"
+
+website:
+  title: "Breeze Labs Docs"
+  site-url: https://quarto.breezelabs.app
+  description: "Technical briefs from the Breeze Labs engineering team."
+  search:
+    location: navbar
+    type: textbox
+  navbar:
+    title: "Breeze Labs Docs"
+    left:
+      - href: index.qmd
+        text: Home
+      - href: voice-stack.qmd
+        text: Voice Stack
+  page-footer:
+    center: "Breeze Labs Engineering"
+
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    toc-title: "On this page"
+    number-sections: true
+    smooth-scroll: true
+    link-external-newwindow: true
+    fig-cap-location: bottom
+    code-fold: false
+    code-tools: false
+
+execute:
+  echo: false
+  warning: false

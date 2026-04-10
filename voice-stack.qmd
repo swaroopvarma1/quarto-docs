@@ -1,0 +1,706 @@
+---
+title: "Breeze Buddy Voice Stack"
+subtitle: "A technical brief on building production voice AI for India"
+author: "Breeze Buddy Engineering"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    toc-title: "On this page"
+    number-sections: true
+    theme: cosmo
+    code-fold: false
+    code-tools: false
+    smooth-scroll: true
+    link-external-newwindow: true
+    fig-cap-location: bottom
+execute:
+  echo: false
+  warning: false
+---
+
+# Executive Summary {.unnumbered}
+
+The voice-AI market is past the novelty phase. Raw model access is commoditising quickly — every major platform now ships real-time speech models, SIP calling, tool use, and structured output. The durable advantage is no longer "we have the model." It is the system wrapped around the model: orchestration, conversational quality tuned for the real world, runtime tuned for live sessions, and feedback loops that turn every call into signal.
+
+Breeze Buddy is that system. This document describes the voice stack we have built inside Clairvoyance, explains the design choices that are load-bearing (and why), and is honest about the parts that are still unfinished.
+
+Our thesis is narrow on purpose. We are not building the most sovereign Indian speech model, the broadest enterprise CX platform, or a general-purpose voice API. We are building **the best-engineered, fastest-moving voice operations layer for India-first commerce workflows**. That is where the gap between what general platforms offer and what the market actually needs is large — and where the engineering depth compounds.
+
+The rest of this document walks through four capability layers we have invested in, each of which corresponds to a point of differentiation that survives the model commodification wave:
+
+1. **Orchestration and flow control** — a template-driven, node-based state machine with LLM-decided but authoritative transitions and fire-and-forget side effects. Non-engineers ship new conversation flows in days; every call is auditable; state and behaviour are decoupled.
+2. **India-specific conversational quality** — blended STT/TTS providers chosen per workflow, strict code-mix handling, payload-driven language selection, Indian number and regional phonetic handling, and noise filtering tuned for 8 kHz telephony.
+3. **Runtime tuned for live sessions** — a one-pod-per-call deployment (Agent's Cloud) with merchant-specific warm pools, circuit-breakered orchestration, Nginx-anchored media streams, pluggable turn-detection strategies, interruption control, and a unified telephony + Daily.co transport layer so every call — phone or web — runs the same pipeline.
+4. **Evaluation and iteration loops** — a reactive evaluation loop already running in production (LLM-as-judge scoring + Slack alerting with recording URLs), and a proactive loop (replay, A/B, pre-deployment regression) that we have the traces for but have not yet built.
+
+At the end we describe where we think investment should go next: closing the proactive evaluation loop, specialised small models for bounded commerce tasks, and a small, deliberate exploration of the speech-native (full-duplex) frontier.
+
+---
+
+# The Problem: Voice + Commerce in India
+
+## What is actually solved
+
+English STT and TTS, in favourable conditions, are largely a solved problem. ElevenLabs, Whisper-class models, Nvidia Parakeet for local transcription, and the major cloud providers all ship output quality that is good enough for most consumer applications. If the entire problem were "transcribe clean English and read it back in a pleasant voice," the industry would have shipped it as an API call and moved on.
+
+That is not the problem we are solving.
+
+## What is not solved, at least not for India
+
+The hard problems for voice + commerce in India are not in the model layer. They are in the space between the model and a reliable, repeatable business outcome. Specifically:
+
+- **Code-mixed speech.** A real customer says *"order ka status check kar sakte ho, please?"* — not pure Hindi, not pure English. Most STT providers either lock to a single language (garbling the mix) or auto-detect (drifting mid-utterance and missing entities).
+- **Accent and dialect variance.** Bangalore English, Kolkata English, and Chennai English are phonetically different. Regional Hindi, Tamil, Telugu, Kannada, Marathi, Malayalam all have dialectal variation that models trained on web-scraped data under-represent.
+- **Noisy telephony.** The real audio channel is 8 kHz µ-law over a mobile network, with background traffic, shop floors, kirana stores, and family conversations in the same room. Clean-audio benchmarks do not predict this.
+- **Conversational determinism.** Real customers pause, backtrack, ask clarifying questions, interrupt, go off-topic, and produce partial answers. A giant-prompt approach is brittle: the LLM will sometimes skip a required step, sometimes ask the same question twice, and occasionally commit a business action with no audit trail. Commerce needs structured, auditable, resumable conversations.
+- **Latency budget.** Voice conversation feels natural when the gap between "user stops" and "bot starts" is around 200 ms. A chat-class 1–2 second budget feels broken. That budget must be split across VAD, STT finalisation, LLM inference, TTS first byte, and the telephony leg. Every layer has to hit its number.
+- **Volume with variance.** India has enormous sheet volume for voice interactions — consumer commerce, delivery coordination, payments, support — but every merchant's workflow is slightly different. "One prompt fits all" never survives production.
+
+These are systems problems before they are model problems. Frontier models will keep improving, but they will not, on their own, solve multi-turn flow control, merchant-specific workflow templating, telephony resilience, interruption strategy, or evaluation infrastructure. Those layers are ours to build — and they are where the long-term advantage sits.
+
+## The four layers where depth compounds
+
+The rest of this document is organised around four capability layers. These are the layers where a general-purpose voice API stays shallow and where an India-first commerce-focused engineering team can build something durably better.
+
+| Layer | What it means in practice |
+|---|---|
+| Orchestration and flow control | A template-driven state machine, LLM-decided transitions, async side effects, auditable outcomes |
+| India-specific conversational quality | Blended STT/TTS per workflow, code-mix handling, payload-driven language selection, regional phonetics, noise filtering |
+| Runtime tuned for live sessions | One-pod-per-call deployment (Agent's Cloud) with merchant-specific warm pools, circuit-breakered orchestration, Nginx-anchored media streams, pluggable turn-detection, interruption control, unified telephony + Daily.co transport |
+| Evaluation and iteration loops | Full-resolution traces, LLM-as-judge scoring with Slack alerting, node traversal and outcome analytics — with a proactive replay/A-B loop still to build |
+
+---
+
+# Architecture at a Glance
+
+## The layered view
+
+A single call traverses six layers. Each layer is pluggable; templates select which provider or strategy runs at each level without any code changes.
+
+```
++--------------------------------------------------------------+
+|  Control plane (Clairvoyance Master, FastAPI)                |
+|  /push/lead/v2 | /template | /webhook | make_call            |
++--------------------------------------------------------------+
+              |
+              v
++--------------------------------------------------------------+
+|  Template layer  (Postgres-backed JSON)                      |
+|  nodes | functions | hooks | global functions | configs      |
++--------------------------------------------------------------+
+              |
+              v
++--------------------------------------------------------------+
+|  Voice-Orchestrator / Smart Router                           |
+|  merchant-specific warm pools | pod allocation | circuit bkr |
++--------------------------------------------------------------+
+              |
+              v
++--------------------------------------------------------------+
+|  Nginx router  (anchors media stream to the assigned pod)    |
++--------------------------------------------------------------+
+              |
+              v
++--------------------------------------------------------------+
+|  Call pod  (one Kubernetes pod per live call)                |
+|  Pipecat Flows | pipeline | transition handler | context     |
+|                                                              |
+|  transport_in -> STT -> turn detection -> LLM                |
+|                                       -> TTS -> transport    |
++--------------------------------------------------------------+
+              |
+              v
++--------------------------------------------------------------+
+|  Transport layer                                             |
+|  Twilio | Plivo | Exotel  (telephony)  |  Daily.co  (web)    |
++--------------------------------------------------------------+
+              |
+              v
++--------------------------------------------------------------+
+|  Network / customer device                                   |
++--------------------------------------------------------------+
+```
+
+Every live call is assigned its own Kubernetes pod. Templates are JSON rows in Postgres; operators edit them without touching code. Each provider at every layer (STT, TTS, LLM, transport) is a swap-in configuration — a template can choose Soniox + ElevenLabs + Twilio for one workflow and Sarvam + Cartesia + Exotel for another. The reasoning for the one-pod-per-call model is covered in detail in §[Runtime Tuned for Live Sessions]; the short version is that it is the only architecture we have found that gives deterministic latency under real production load.
+
+## The pipeline frame flow
+
+Inside the pipeline, audio and text flow through an ordered set of Pipecat processors. The order matters: this is where the real-time behaviour of the conversation is decided.
+
+```
+raw audio bytes
+     |
+     v
+[ transport.input ]          <- mu-law 8kHz for telephony, PCM 16kHz for Daily
+     |
+     v
+[ STT service ]              <- Soniox | Deepgram | Sarvam | Google | OpenAI
+     |  (interim + final transcripts)
+     v
+[ transcription gate ]       <- optional mute/filter while bot speaks
+     |
+     v
+[ user aggregator + VAD ]    <- turn detection: stt_native | smart_turn | timeout
+     |                          interruption: enabled | disabled_discard | min_words
+     v
+[ LLM service ]              <- Azure OpenAI | Vertex Gemini | Claude on Vertex
+     |  (text + function calls)
+     v
+[ TTS service ]              <- ElevenLabs | Sarvam | Cartesia | Google
+     |
+     v
+[ assistant aggregator ]     <- context update, interruption handling
+     |
+     v
+[ transport.output ]         <- mu-law 8kHz back to the telephony provider
+```
+
+When the LLM emits a function call, control leaves the pipeline and enters the template transition handler (see §[Orchestration and Flow Control]). When a transition happens, the flow manager swaps the node config underneath the LLM context and the conversation continues. When the user idles past a configured threshold, the idle processor fires a callback that can retry a prompt, escalate, or end the call.
+
+::: {.callout-note}
+**Why this structure is load-bearing.** Each processor has a single responsibility, and frames flow in one direction. Adding a new capability (a new noise filter, a new turn strategy, a new transcription gate) means adding a processor, not rewriting the pipeline. Every voice AI product eventually grows this shape. We started here on purpose.
+:::
+
+---
+
+# Orchestration and Flow Control
+
+This is the layer that most clearly separates a production voice product from a demo. A state machine with clear transitions and side effects is what lets non-engineers ship new flows safely, lets us debug failures by reading logs, and lets us evolve behaviour without rewriting the pipeline every time.
+
+## Why a node-based flow, not a giant prompt
+
+The three alternatives we rejected:
+
+- **Giant prompt.** Put all the instructions in the system prompt and let the LLM drive the entire conversation. This is fast to prototype and impossible to operate. The LLM will sometimes skip mandatory steps, sometimes repeat itself, sometimes commit a business action without logging it. Worst of all, there is no structured outcome — you end up parsing free text to figure out what happened.
+- **Procedural if/else.** Hand-code the entire flow in Python. Slow to ship, rigid, and every merchant-specific variation becomes a pull request.
+- **General-purpose workflow engine.** Too heavy. The flow models in those systems are not built around LLM function calls and turn-by-turn conversation state.
+
+We use **Pipecat Flows** as the underlying state machine and layer a JSON template on top. The template is the source of truth; the pipeline builds from it at call time. Transitions are LLM-decided (via function calls) but authoritative once taken, and side effects are async and non-blocking. This combination gives us both the flexibility of LLMs and the determinism of a state machine.
+
+## What a template looks like
+
+A template is a JSON document in Postgres with three layers: configuration (STT/TTS/VAD/interruption choices), nodes (the conversational state machine), and global functions (HTTP calls or built-in actions available from every node).
+
+```json
+{
+  "id": "tpl-order-confirmation",
+  "configurations": {
+    "stt_configuration": {
+      "provider": "soniox",
+      "language": ["en", "hi"],
+      "turn_detection": "stt_native",
+      "soniox": { "context": "...domain JSON with product and merchant terms..." }
+    },
+    "tts_voice_name": "rhea",
+    "vad_config": { "confidence": 0.5, "stop_secs": 0.3 },
+    "interruption": { "mode": "enabled", "min_words": 2 }
+  },
+  "flow": {
+    "initial_node": "greet",
+    "nodes": [
+      {
+        "node_name": "greet",
+        "task_messages": [
+          { "role": "system",
+            "content": "You are confirming {customer_name}'s order {order_id}." }
+        ],
+        "functions": [
+          {
+            "name": "confirm_order",
+            "description": "Customer has confirmed they want to proceed.",
+            "properties": { "confirmed": { "type": "boolean" } },
+            "required": ["confirmed"],
+            "transition_to": "confirmed",
+            "hooks": [
+              { "name": "update_outcome_in_database",
+                "expected_fields": {
+                  "outcome": { "source": "static", "value": "CONFIRMED" }
+                } }
+            ]
+          }
+        ]
+      },
+      { "node_name": "confirmed", "task_messages": [/* ... */], "functions": [] }
+    ],
+    "global_functions": [
+      {
+        "type": "http",
+        "name": "check_inventory",
+        "description": "Check if an item is in stock.",
+        "http_request": {
+          "method": "GET",
+          "url": "https://inventory.example.com/check?item={item_id}",
+          "timeout": 5,
+          "max_retries": 2
+        }
+      }
+    ]
+  }
+}
+```
+
+A few things to notice:
+
+- Variables like `{customer_name}` and `{order_id}` are rendered at template **load** time from the lead payload, credentials, and template secrets — not at LLM time. This is deterministic, cheap, and auditable.
+- `functions` attached to a node are the transitions the LLM can choose. Each function optionally specifies `transition_to` (where to go next) and `hooks` (async side effects).
+- `global_functions` are callable from any node. HTTP global functions block the conversation until the external call returns; built-in ones route to internal handlers (warm transfer, end conversation, get current time, and so on).
+
+## The transition handler, and why it matters
+
+When the LLM calls a function, control lands in our **transition handler**. The design choice here is load-bearing.
+
+1. **Hooks are scheduled as a fire-and-forget async task.** They do not block the transition. A slow database update or a flaky webhook never delays the next node.
+2. **The transition itself is authoritative and immediate.** If the function specifies `transition_to`, we record the node exit, swap the VAD/interruption config to any node-level overrides, construct the next node's config, record entry, and hand control back to the flow manager. No conditional logic based on hook success.
+3. **If the function does not specify a `transition_to`, we stay on the node.** This is how global functions work: they return data (from an HTTP call or a built-in action) to the LLM, which uses the result to decide the next turn.
+
+The effect is a conversation that feels crisp — the bot moves on the instant a decision is made — while the audit trail (outcomes, webhooks, database updates) catches up in the background.
+
+## Hooks versus functions versus global functions
+
+These three concepts are easy to confuse. The table clarifies their roles:
+
+| Concept | Who invokes it | Blocking? | What it returns | Scope |
+|---|---|---|---|---|
+| Node function | LLM (function call) | Yes, briefly | Determines the next node | Current node |
+| Hook | Attached to a node function | No (fire-and-forget) | Nothing | Current node's function |
+| Global function | LLM (function call) | Yes (waits for result) | Data to the LLM, no node change | Every node in the flow |
+
+This separation is the reason we can ship complex integrations (CRM updates, external validations, webhooks) without making the conversation feel sluggish.
+
+## Handler architecture
+
+Handlers live in two directories. **Internal handlers** (`handlers/internal/`) cover warm transfer, end-of-conversation, STT mute/unmute, audio playback, and the built-in function dispatcher. **Transport handlers** (`handlers/transport/`) cover HTTP global functions — the path for integrations with a merchant's own systems.
+
+Warm transfer is a good example of how handlers compose. When the LLM calls `connect_to_live_agent`:
+
+1. The built-in dispatcher routes to the warm-transfer handler.
+2. The handler fetches the outbound number and the transfer target from the template.
+3. It sets a Redis flag for the telephony provider (keyed by `call_sid`) with a short TTL.
+4. It calls the provider-specific conference service (Twilio, Plivo, or Exotel each has its own bridging mechanism).
+5. On success, it invokes the end-of-conversation path to release the AI side cleanly.
+6. Meanwhile, the end-of-conversation hook collects the transcription from the LLM message history and stores it on the lead.
+
+Every step is the same regardless of which telephony provider you use. The provider abstraction is in the service layer.
+
+## Playground overrides
+
+Operators and product teams can override STT, TTS, VAD, and interruption configuration at runtime by inserting a lead with `is_playground=true` and a `configurations_override` payload. The override is applied at greeting synthesis and at pipeline build time. This is how we let merchants iterate on voice configuration without redeploying templates. It is a small feature with outsized effect on how quickly we can debug a conversation issue.
+
+## Why this layer is a moat
+
+Because it turns conversation design from an engineering task into an operational task. A new merchant workflow that would take a week of prompt engineering and pull requests in a prompt-only system takes a day (sometimes an afternoon) with templates. The cost of shipping a variant drops by an order of magnitude — and that is where the sheet volume of the Indian commerce market becomes unlockable instead of daunting.
+
+---
+
+# India-Specific Conversational Quality
+
+This section answers the question we hear most often from people outside the voice space: *"If English STT and TTS are basically solved, what is left for you to do?"* The honest answer is: most of it.
+
+## English is the foundation, not the ceiling
+
+Our default production pipeline is English-first: Soniox for STT, ElevenLabs for TTS, with Indian-English voice tuning. This is a deliberate choice. English-first is reliable today, it covers a large share of early-majority commerce conversations, and it gives us a stable baseline against which to measure the multilingual extensions. We do not treat English as a limit; we treat it as the part of the stack that is allowed to be boring so the rest of it can be interesting.
+
+## Code-mixing is the real India problem
+
+A representative consumer sentence from a production call looks like this:
+
+> *"Hi, mera order kab ayega? Please delivery boy ko address confirm karwa dena, okay?"*
+
+This is not Hindi. It is not English. It is a single utterance with five language switches and a regional-English interjection. Most STT providers handle this poorly in two distinctive ways:
+
+- **Single-language mode** garbles the non-primary language. A provider locked to English will transcribe *"kab ayega"* as noise or as nonsense English words.
+- **Auto-detect mode** drifts. The provider commits to a language at the start of the utterance and the rest of the sentence is transcribed in the wrong language.
+
+Our approach is blended and explicit:
+
+- **Soniox with strict language hints.** The default for English-first and English+Hindi workflows. The template passes `language_hints: ["en", "hi"]` with `language_hints_strict=true`, which forces the model to only emit those two languages. We pair this with a structured **context JSON** carrying merchant-specific terms (product names, status terminology, payment methods) so the model has domain grounding instead of general-web priors.
+- **Sarvam saarika for code-mixed-first workflows.** When a workflow is primarily regional and lightly code-mixed with English, Sarvam's saarika model is purpose-built for this. We use it selectively where it is stronger than the alternatives.
+- **Deepgram Nova-3 with `numerals=true`.** For workflows where spoken numbers dominate (amounts, order IDs, OTP readback), Deepgram's numeral handling — including Indian-style "lakh" and "crore" — is more reliable than any alternative at the time of writing.
+- **Google and OpenAI.** Available as fallbacks and for specific language/workflow combinations.
+
+The point is that **no single provider is "good enough" for every workflow in India**. Treating STT as a blended strategy — different providers for different templates, chosen at configuration time — is more expensive to operate than a single-vendor default, and produces meaningfully better outcomes in production.
+
+::: {.callout-warning}
+**The honest take on Sarvam.** Sarvam is improving quickly and has genuine strength in code-mixed Indian speech and regional TTS. For our commerce workflows today it is a selective tool, not a default. The same will be true for any single-vendor bet for the foreseeable future. The win is being able to choose per workflow, measure per workflow, and switch per workflow — not betting the product on a single provider's roadmap.
+:::
+
+## TTS: three providers, three different wins
+
+| Provider | When we reach for it |
+|---|---|
+| **ElevenLabs** | Default. Fast synthesis, consistent voice personality across calls, Indian residency endpoint available, EN-IN voice tuning. Good for most English-first and English+Hindi commerce workflows. |
+| **Sarvam** | Regional-language workflows where natural pronunciation matters most. Automatic script detection (Devanagari → Hindi, Telugu → Telugu, Tamil → Tamil, etc.) with region-specific phonetics. |
+| **Cartesia** | When the workflow benefits from emotion control (neutral / warm / excited) or a speed multiplier (for complex instructions read slowly). Also useful for merchant-custom voices. |
+
+TTS, like STT, is a per-template choice, and for workflows where language selection depends on the lead payload we support **LLM-driven voice selection** at call time.
+
+## Payload-driven language selection
+
+Many leads carry enough structure for us to infer language and regional tone before the call even starts. A customer's city, name, and order metadata are reliable signals. The lead insertion path takes the template configuration and the payload, and resolves:
+
+- The primary language for the call (e.g. Kannada for a Bangalore delivery, Hindi for a Patna delivery).
+- The TTS voice to use for that call.
+- Regional phrasing guidance injected into the system prompt.
+
+For Hindi, Tamil, Telugu, Kannada, Marathi, Bengali, Gujarati, Punjabi, Malayalam and Odia workflows, the system prompt is augmented with guidance to use regional expressions and formal second-person forms (*aap*, *meeru*, *neengal*) rather than direct translation of English conversational conventions. This small step — a few hundred tokens of prompt — is the difference between a bot that sounds translated and a bot that sounds local.
+
+## Indian number handling
+
+Amounts and quantities are a recurring failure point for generic voice pipelines. *"Twenty-three lakh"* is not parsed correctly by models trained on Western number conventions. *"Paanch sau rupaya"* mixes script and language. *"Ek thousand do sau"* is a 1200 expressed across two languages.
+
+We handle this in two layers. First, provider-level: Deepgram's `numerals=true` is configured for number-heavy workflows, and Soniox's context JSON carries Indian-style numeric terminology. Second, the transformation-function registry (used at template render time and in post-processing) normalises Indian number formats into machine-friendly values before they are passed to downstream systems.
+
+## Noisy environments
+
+Production audio is 8 kHz µ-law over mobile networks. The audio has telephony band-limiting, network jitter, and real-world ambient noise (traffic, family conversations, shop floors). We handle this with:
+
+- **Optional AI Coustics noise filtering** (AIC), applied pre-STT, toggled per template. Adds a small amount of latency in exchange for meaningfully better STT accuracy in noisy conditions.
+- **Silero VAD parameters tuned for 8 kHz telephony**, with configurable confidence, start/stop seconds, and minimum volume. A Daily.co web call runs with different parameters than a Twilio call because the audio characteristics are different.
+- **Provider-level endpoint detection** tuned through configuration (Soniox `max_endpoint_delay_ms`, Deepgram endpointing milliseconds, Sarvam high VAD sensitivity for noisy lines).
+
+## Where frontier models cannot catch up fast
+
+Frontier models are trained predominantly on public web-scale data, which under-represents India-specific speech — and especially under-represents code-mixed, accented, noisy-telephony Indian speech. Every call we run produces a trace that nobody else has. That data does not become advantage on its own; it becomes advantage when the evaluation loop (next-but-one section) is closed.
+
+---
+
+# Runtime Tuned for Live Sessions
+
+Voice is a real-time system, not a request/response system. The conversational latency budget is roughly 200 ms between *"user stops speaking"* and *"bot starts speaking"* to feel natural. That budget has to cover VAD detection, STT finalisation, LLM inference, TTS first byte, and the telephony round trip. Every layer must hit its number or the conversation feels broken.
+
+But the per-turn latency budget is only half the story. The harder problem is making latency **predictable under real production load** — not on a lab benchmark, not with one call in the system, but across thousands of concurrent sessions with unpredictable CPU spikes, garbage collection pauses, noisy neighbours, and provider hiccups. The architectural choice that decides whether a voice product works in production is the answer to a simple question: *how do you isolate one call from another?*
+
+## Why isolation is a correctness requirement, not an optimisation
+
+Real-time audio has strict latency determinism requirements, and shared compute environments create fundamental problems: unpredictable latency spikes, CPU contention, memory pauses, fault propagation, and debugging complexity. We evaluated three concurrency models before settling on the one we run in production.
+
+### Scenario 1 — Many calls per pod, asyncio (the naive approach)
+
+Handle multiple concurrent WebSocket streams in a single Python process using `asyncio`. This is the obvious starting point, and it is wrong for real-time voice.
+
+Python's Global Interpreter Lock means only one thread executes bytecode at a time. `asyncio` is excellent at I/O waiting, but any CPU-intensive task — VAD inference, audio resampling, µ-law encoding, tokenisation — blocks the entire event loop. If ten calls are sharing one process and one of them hits a heavy computation window, the event loop freezes for all ten users. The audible result is robotic voice, stuttering, jitter, and a broken human-like flow.
+
+Adding more CPU cores to the pod does not fix this: the event loop is single-threaded. You can add cores, but you cannot add teachers.
+
+::: {.callout-note}
+**Analogy.** One teacher handling ten students. If one student asks a hard question, the teacher must focus on that student while the other nine wait silently. Adding more chairs does not give you more teachers.
+:::
+
+### Scenario 2 — Many calls per pod, subprocess per call
+
+Spawn a separate OS subprocess for each call inside the same pod. Each subprocess has its own interpreter and its own GIL, so multiple cores can actually be used. This is better than asyncio, and it is still not enough.
+
+The reason is **container boundary enforcement**. Kubernetes enforces CPU limits at the container level, not the process level. If one subprocess bursts CPU usage inside a 100 ms window, it can consume the entire pod's CPU quota for that window, and the Linux Completely Fair Scheduler (CFS) then throttles *the entire container*. Every other subprocess in that pod pauses temporarily — even ones that were idle — producing micro audio freezes and non-deterministic latency.
+
+::: {.callout-note}
+**Analogy.** The classroom now has helper teachers (subprocesses), one per student. But the classroom has only one electricity breaker (the pod's CPU quota). When one helper turns on a heavy heater, the breaker trips for the whole room, and every student's lights flicker — even the ones who were doing nothing.
+:::
+
+### Scenario 3 — One call per pod (what we run)
+
+Each call is assigned its own Kubernetes pod with dedicated CPU and memory (for example 1 vCPU / 1 GiB per pod, sized per merchant tier). This is the architecture we run in production. It gives us four properties that the other scenarios do not:
+
+- **Deterministic latency boundaries.** A CPU spike in one call cannot throttle another call.
+- **Garbage-collection isolation.** Python stop-the-world GC pauses are limited to that one session.
+- **Fault isolation.** If an audio driver crashes, a tool call segfaults, or an OOM happens, only that one call dies — every other call continues uninterrupted.
+- **Operational simplicity.** One set of logs, one resource accounting, one lifecycle per call. Debugging is dramatically simpler.
+
+### Trade-off summary
+
+| Property | Shared pod (asyncio) | Shared pod (subprocess) | **One pod per call** |
+|---|---|---|---|
+| Latency consistency | Very low | Medium | **High** |
+| Audio jitter | High | Medium | **Minimal** |
+| Fault isolation | None | None | **Perfect** |
+| Debuggability | Complex | Complex | **Simple** |
+| Production safety | Low | Medium | **High** |
+| Real-time suitability | Poor | Risky | **Industry standard** |
+
+The one-pod-per-call pattern is what Pipecat Cloud recommends ("one bot per session"), what LiveKit Agents does ("isolate jobs per container"), and what Google Agones is built for ("session-based isolation at massive scale"). Real-time voice systems share most of their constraints with multiplayer game servers — stateful sessions, low-latency tolerance, strict isolation — and the same architectural pattern wins in both domains for the same reasons.
+
+## Agent's Cloud: our one-pod-per-call runtime
+
+The production implementation of this pattern is what we call **Agent's Cloud**. A single call flows through it like this:
+
+1. **Clairvoyance Master (the control plane)** receives the lead and issues a `make_call` to the telephony provider.
+2. **Voice-Orchestrator (Smart Router)** receives the corresponding session-setup request, identifies the merchant, and selects an available pod from that merchant's warm pool. It returns a unique WebSocket URL.
+3. **Telephony provider** (Twilio, Plivo, Exotel) initiates the media stream to that WebSocket URL. For web calls, the Daily.co transport does the same thing with a Daily room URL.
+4. **Nginx router** receives the media stream and anchors it directly to the specific pod assigned to that session.
+5. **The call pod** runs the full Pipecat pipeline end to end for the duration of the call: transport → STT → turn detection → LLM → TTS → transport. The pod is dedicated to exactly one call.
+6. **On call end**, the pod is recycled back into the warm pool or terminated, depending on its current state and merchant tier.
+
+The Smart Router client is wrapped in a **circuit breaker** so that a brief router outage does not take every new call with it: when the router fails consecutively beyond a threshold, the breaker opens, new calls fall back to a direct (non-isolated) path, and the breaker gradually transitions back through half-open to closed as health recovers. Graceful degradation over hard failure.
+
+## Merchant-specific warm pools
+
+A cold Kubernetes pod costs 30–60 seconds to start: scheduling, image pull, model loading, interpreter warm-up, dependency wiring. Thirty seconds of silence at the start of a voice call is a conversation that will never happen. So the orchestrator maintains pre-initialised, warm pods waiting for assignment — the voice equivalent of a server keeping a connection pool hot.
+
+The pools are **merchant-specific** on purpose:
+
+- Different merchants run different templates with different STT/TTS/LLM combinations. Pre-warming a generic pod and reconfiguring it per call defeats the point.
+- Merchant tier drives pod size. A simple COD confirmation bot runs on a lightweight pod; a heavy multi-tool workflow runs on a larger pod. Same architecture, different capacity per tier.
+- Zombie-pod cleanup runs automatically: pods that are stuck in an unhealthy state or have exceeded their lifecycle budget are reclaimed so the pool always represents real, usable capacity.
+
+The operational target is on the order of 10,000+ calls per hour with roughly 40 concurrent calls per minute, and the pool-sizing math is a straightforward function of concurrency, average call duration, and merchant mix. The total CPU and memory we use across the cluster is comparable to a vertically-scaled design — the difference is that the resources are distributed horizontally so isolation is free.
+
+## Telephony and Daily.co: one transport layer, four providers
+
+Buddy is a telephony-first product. The call channels we care about are mobile phone calls and, for specific web/mobile workflows, browser audio via Daily.co. The transport layer presents a unified interface to the rest of the stack so that a template does not know or care which channel it is running on.
+
+| Provider | Channel | Audio format | Where it fits |
+|---|---|---|---|
+| **Twilio** | Telephony (outbound & inbound) | µ-law 8 kHz, Twilio Media Streams | Primary and most widely used; strong international reach |
+| **Plivo** | Telephony | µ-law 8 kHz, custom WebSocket | Alternative provider with its own routing and pricing strengths |
+| **Exotel** | Telephony | µ-law 8 kHz, custom WebSocket | Strong India presence, per-number channel management |
+| **Daily.co** | Web / mobile browser | PCM 16 kHz, Daily transport | Web and in-app voice, also used by the product team for playground testing |
+
+Every one of these providers has its own WebSocket protocol, its own webhook format, its own recording API, and its own failure modes. Abstracting them behind a single transport interface is grunt work that pays for itself every time a merchant asks to switch provider (for cost or compliance reasons) and we do it with a configuration change instead of a code change.
+
+What we get from this abstraction in production:
+
+- **Per-call failover across telephony providers.** A call initiated on the primary provider that fails to connect falls back to a secondary provider automatically. The merchant sees "the call went through"; they do not see the provider choice.
+- **Unified recording, transcription and outcome pipelines.** Recordings are downloaded post-call via the provider-specific API, stored centrally, and surfaced through the same alerting and analytics paths regardless of which provider ran the call.
+- **Number-level rate limiting** with a Redis sliding-window counter. Per-destination rate limits are tracked, alerted on Slack when exceeded, and — on a per-number configurable toggle — can block further calls outright to protect deliverability reputation.
+- **Warm transfer across all three telephony providers.** When the LLM calls the `connect_to_live_agent` function, the transport layer routes the conference setup through the right provider-specific mechanism (Twilio conference, Plivo dial-up, Exotel flow) behind a single interface.
+- **Daily.co for web workflows and playground mode.** The same pipeline, same templates, same observability — the only thing that changes is the transport processor at the edge of the pipeline.
+
+This is the layer that, in practice, most merchants notice first. A voice product that cannot switch providers cleanly, cannot fail over during a provider outage, and cannot run the same template over phone and web with the same behaviour is a voice product that will have to be partially rewritten every few months. Ours does not.
+
+## Turn detection: three strategies, one template choice
+
+Turn detection is the single most influential knob for how natural a voice conversation feels. We support three strategies, and the template picks one per workflow:
+
+| Mode | How it decides the user is done | Strengths | Weaknesses |
+|---|---|---|---|
+| `stt_native` (default) | STT provider emits a semantic end-of-turn signal | Fastest; provider-optimised; works well with Soniox | Depends on provider endpoint quality |
+| `smart_turn` | Local Whisper-class ONNX model (`SmartTurnAnalyzerV3`) analyses prosody and pauses | Handles natural hesitation well; provider-agnostic | Higher latency; some CPU cost |
+| `timeout` | Timer-based: wait N seconds after the last finalised transcript | Simple; predictable; any provider | Artificial delay on every turn |
+
+Being able to choose per workflow is what lets us say "for an address-collection flow where users speak slowly with pauses, use `smart_turn`" and "for a quick confirmation flow, use `stt_native` for minimum latency". A single-strategy product has to pick a compromise; a template-driven product does not.
+
+## Interruption control
+
+Interruption handling is how the bot distinguishes "the user is correcting me" from "the user just said 'uh-huh' while I was speaking". Three modes:
+
+- **`enabled`** — the bot stops mid-sentence when the user speaks, the interruption is forwarded to the LLM, and the LLM can respond. This is the default human-feeling mode.
+- **`disabled_discard`** — user audio frames are dropped while the bot is speaking. Useful when the bot is reading critical information (terms, amounts, OTPs) and an interruption would be a business hazard.
+- **`enabled` + `min_words`** — the user must speak at least N words before the interruption fires. This stops single-word backchannels (*"um", "okay", "hmm"*) from hijacking the conversation.
+
+Each of these is a template-level choice and can be overridden per node.
+
+## Would switching language remove the need for any of this?
+
+A question we get occasionally: *if we rewrote the voice agent in Go or Rust, would we still need one-pod-per-call?* The answer is yes, with nuance.
+
+A language switch would eliminate the GIL bottleneck, improve native multi-core utilisation, and — in Rust's case — remove garbage-collection pauses entirely. All of that would make Scenario 1 (many calls in one process) stronger in absolute terms. But none of it changes the structural constraints that motivate isolation in the first place:
+
+- Kubernetes CPU limits are still enforced at the container level, and CFS throttling still freezes the entire container when the quota is exceeded.
+- A single crash can still bring down every session sharing a pod.
+- Memory pressure still affects every session inside the container.
+- The noisy-neighbour problem still exists — in any language.
+
+The container boundary is the real isolation boundary, and the container boundary does not care what language is running inside. Switching language is a **performance optimisation**; per-call isolation is a **correctness property**. For real-time voice in production, you need both eventually, but the isolation has to come first.
+
+## What the runtime layer delivers
+
+Put together, Agent's Cloud is the layer that turns a voice agent that works in a demo into a voice product that works in production. We are not at the theoretical limit on every axis — nobody is — but we are at the point where the dominant latency contributor in most calls is the LLM itself, not our plumbing. That is the right place to be: every improvement in frontier-model latency translates directly into improvement in the product without any engineering on our side.
+
+---
+
+# Evaluation and Iteration Loops
+
+::: {.callout-warning}
+This is the section where we have to be most honest, because it is the area with the biggest gap between what we have already built and what we should eventually have. The gap is not catastrophic — we run a reactive evaluation loop in production today — but closing it is high leverage and we should name it clearly.
+:::
+
+## What we already run in production
+
+Every call produces a complete, structured trace:
+
+- **OTEL root span per conversation**, named with a `customer_name-shop_name-timestamp` identifier and decorated with attributes covering the lead payload, the full conversation metadata, the final outcome, the call duration, and the attempt count.
+- **Nested tool spans** via auto-tracing decorators, so every LLM call, function invocation, STT decision, and TTS request shows up as a child span.
+- **Full transcription storage** on the lead record as an array of `{role, content}` pairs collected from the LLM message history at the end of the conversation.
+- **Node traversal tracking** on the lead metadata: every node entry and exit, with IST timestamps, duration, the function that triggered the transition, and the arguments the LLM supplied.
+- **Outcome storage** in both a canonical outcome column and a structured metadata dict, so analytics can slice by outcome and workflow.
+- **Analytics endpoints** exposing per-merchant call counts, outcome breakdowns, duration distributions, transfer rates, and time-series trends.
+
+On top of that, we run an **automated reactive evaluation loop**:
+
+- Traces are exported via OTLP to Langfuse.
+- LLM-as-a-judge evaluators score conversations on multiple axes (outcome correctness, latency, safety, escalation quality — the set is configurable via dynamic config).
+- A background task — running on a 60-second scheduler loop, guarded by a Redis distributed lock so only one pod executes at a time — polls Langfuse every 10 minutes for new scores.
+- Overlapping time windows guarantee 100% coverage even across pod restarts.
+- Per-call deduplication (keyed by call SID) prevents duplicate alerts.
+- When a score falls below a configured threshold, a Slack alert is sent with the call context, masked phone number, evaluator name, score, and a direct link to the call recording.
+
+This is more evaluation infrastructure than most voice AI products actually run in production. It closes the loop between "a bad call happened" and "an engineer can see the full context and act within minutes". It is also, genuinely, a product advantage: when we onboard a new merchant, we can show them the alerting dashboard on the first day.
+
+## What we have not yet built
+
+The reactive loop tells us when something has already gone wrong in production. The **proactive loop** — the loop that prevents regressions before they ship — has most of its pieces missing:
+
+- **Replay harness.** The ability to re-run a historical call against a new template or prompt and compare outcomes. We have the traces, transcriptions, and node histories to do this; we have not built the harness that runs them through a candidate template and scores the deltas.
+- **A/B testing infrastructure.** Split traffic between template variants, measure outcome deltas with enough statistical rigour to decide, and automatically promote winners. Our template system already supports the variants; the experiment framework around them does not exist yet.
+- **Pre-deployment regression gates.** A curated set of (scripted and real-trace-derived) scenarios that every template change must pass before shipping. Today a template change is tested manually in playground mode.
+- **Uncertainty calibration on critical slots.** For address collection, payment confirmation, and OTP readback, we capture STT confidence at the token level but do not yet use it to decide "ask the customer to repeat" vs "proceed". This is the single highest-value safety improvement we could make for commerce workflows.
+- **Teacher trajectories.** Ideal conversation paths for each workflow family, used as a reference signal to measure how far production calls drift from the intended path. The node-traversal data we already log is the right raw material for this.
+
+## Why closing the loop is important
+
+Every production call is private, India-specific, code-mixed, accented, noisy data. It is the kind of data that cannot be bought and cannot be scraped. Without a systematic evaluation loop, it is just trace data sitting in Postgres and Langfuse. With one, every call improves the next call, and every merchant we serve makes every subsequent merchant's deployment more reliable.
+
+This is the compounding part of the product. It should be invested in, deliberately and with patience. It is not the *only* thing to invest in — we need the conversational quality and runtime work to continue in parallel — but it is the thing most likely to turn today's engineering depth into a lasting advantage.
+
+## The context-summarisation gap
+
+One smaller but concrete gap worth naming: long conversations grow the LLM context unbounded. Pipecat does not ship a built-in summariser, and we have not yet written a Breeze-Buddy-specific one. For short commerce calls this is not a problem; for longer support or escalation calls it becomes a cost and latency vector. Closing this is a modest amount of work and is already on the near-term list.
+
+---
+
+# Pipeline Deep Dive
+
+This section is for readers who want to go one level below the architecture diagrams without reading the code directly. It exists to make the point that the engineering depth in this stack is real — not by listing every class and method, but by showing the design choices that matter.
+
+## Turn detection strategies, in detail
+
+Turn detection is not a single processor. It is a set of **start strategies** (what counts as "the user has started speaking?") and **stop strategies** (what counts as "the user is done?") attached to the user aggregator.
+
+**Start strategies** we can combine:
+
+- **VAD-based start.** Silero VAD detects speech energy and emits an `is_speech` signal. Fast, but false-fires on background noise.
+- **Transcription-based start.** Interim STT transcripts trigger the start. This catches soft speech that VAD would miss, but has more latency.
+- **Minimum words start.** The user must speak at least N words before the start fires. Combined with one of the above, this is how we suppress single-word backchannels from triggering an interruption.
+
+**Stop strategies** are mutually exclusive per mode:
+
+- **Accumulating-speech timeout.** Wait N seconds after the last finalised transcript. Used for `stt_native` (0.0 s — immediate) and `timeout` (configurable).
+- **Turn-analyser stop.** Feeds accumulated audio into the SmartTurn ONNX model, which predicts "user is done" from prosody. Used for `smart_turn`. When no external VAD is provided, SmartTurn auto-creates a Silero VAD with `stop_secs=0.2` as its trigger signal.
+
+The reason we surface all of this is that naturalness of conversation is extremely sensitive to these parameters, and production voice products that get praised for "feeling human" all have some version of this machinery. Ours is template-driven, which is the part that lets us iterate on it per workflow.
+
+## The call lifecycle state machine
+
+A lead moves through a small, deterministic state machine. We describe it because it is the part of the system most operational staff interact with, and it is where a lot of reliability work lives.
+
+```
+        +---------+
+        | BACKLOG |<----------------------------+
+        +----+----+                             |
+             |  cron pick + Redis lock           |
+             v                                   |
+     +---------------+                           |
+     |  pre-checks   |  fail-open per check      |
+     +-------+-------+                           |
+             |  pass                             |
+             v                                   |
+     +---------------+                           |
+     | acquire number|                           |
+     +-------+-------+                           |
+             |                                   |
+             v                                   |
+     +-------+-------+   init-failure  +---------+
+     | provider call |-----------------> retry w/
+     +-------+-------+                 | fallback
+             | connected                 +----+---+
+             v                                |
+     +---------------+                        |
+     |  PROCESSING   |<-----------------------+
+     +-------+-------+
+             |
+             v
+     +---------------+        BUSY / NO_ANSWER
+     | conversation  |-----------------+
+     +-------+-------+                 |
+             |                         v
+             v                  +----+----+
+     +---------------+          | BACKLOG |
+     |   FINISHED    |          | (retry) |
+     +---------------+          +---------+
+```
+
+A few reliability details worth calling out:
+
+- **Atomic Redis-backed lock on lead pick-up**, so the same lead is never picked by two pods simultaneously. A stuck-call watchdog cleans up leads that have been in `PROCESSING` too long.
+- **Per-check fail-open configuration.** Each external pre-check can be configured to `proceed` on external-API failure (fail-open) or `skip` (fail-closed). Most commerce pre-checks are fail-open so the business does not stall when a third party goes down.
+- **Retry policy for BUSY / NO_ANSWER outcomes.** The lead is rescheduled with an exponential backoff and a bounded attempt count.
+- **Recording download and storage** is provider-specific and handled after the call ends, so the pipeline itself is never blocked on S3 or provider-API latency.
+- **End-of-conversation callbacks** run the transcription-export path, the reporting webhook with retry, and any template-specific post-call hooks.
+
+## Configuration layering
+
+The configuration model has three layers, each of which can override the one below:
+
+1. **Static config** from environment variables, loaded once at process start. This is the baseline — infrastructure endpoints, default providers, pool sizes, feature flags.
+2. **Dynamic config** from Redis (populated by DevCycle and similar feature-flag systems), accessed via async functions that fall back to defaults. This is what lets us tune provider choices, thresholds, and per-tenant behaviour without deploying.
+3. **Template-level config** embedded in each template, which is what operators and merchants edit. Template config overrides both of the above for any call using that template.
+
+There is also a **playground override** path for runtime experimentation on a single lead, as described in the orchestration section.
+
+This layering is the reason we can run 200+ merchants on the same codebase with genuinely different voice behaviours — and is the reason new provider rollouts (a new Sarvam model, a new ElevenLabs voice) happen via a Redis flag change, not a deploy.
+
+---
+
+# Where to Invest
+
+The four-layer framing is also our investment framing. Each layer has a near-term improvement and a longer-term bet.
+
+## Close the proactive evaluation loop
+
+This is the highest-leverage incremental investment. The trace data is already there; the reactive alerting is already running. What is missing is the replay harness, the A/B framework, the regression gates, and the uncertainty-calibration work on critical slots. Each of those is a small, well-defined project. Together they turn "we know when something goes wrong" into "we systematically make the next deployment better than the last one", and they let us report outcome improvements to merchants with confidence.
+
+## Specialised small models for bounded commerce tasks
+
+Frontier models are very good at open-ended reasoning and very expensive per token. A specialised small model — fine-tuned on our own traces for intent capture, slot filling, tool calling, and structured summarisation on a specific workflow family — can handle the bulk of the per-turn work at a fraction of the latency and cost, with a frontier model available as a fallback for anything the small model is not confident about.
+
+The approach we are most interested in is layered specialisation: train and evaluate separately on language, conversation flow, tool usage, and policy/safety; iterate using failure-driven data from production; then merge into a single conversational SLM with regression gates across all axes. This is the kind of work that pays back slowly but permanently, and it is only feasible once the evaluation loop is in place.
+
+## Orchestration depth: reusable flow primitives
+
+The template system today is flexible enough that any merchant workflow can be expressed, but every new merchant still writes their own template from scratch. The next evolution is **reusable flow primitives** — address collection, payment confirmation, OTP readback, escalation handoff — that merchants compose instead of writing. This reduces deployment time further, concentrates improvements (a fix to the address primitive improves every merchant that uses it), and is the groundwork for simulation and automated testing of templates.
+
+## A small, deliberate bet on the speech-native (duplex) frontier
+
+The next model frontier is speech-in → speech-out without an intermediate text representation. Gemini Live, GPT-4o Voice, and emerging research in full-duplex models all point this way. When this becomes production-ready for commerce, it changes the nature of turn-taking and interruption: conversation becomes continuous rather than punctuated, and a lot of the carefully tuned VAD / STT endpointing / interruption work moves inside the model.
+
+We should not redesign the product around this today — it is not ready and the economics are not clear. We should **budget a small amount of engineering to prototype it** alongside the main stack, so that when it becomes viable we are ready to move quickly. The good news is that almost all of the engineering depth described in this document — the template layer, the orchestration, the state machine, the observability, the multi-provider runtime — carries forward regardless of the model substrate underneath. A speech-native model is a different pipeline processor, not a different product.
+
+## India trace data as a compounding advantage
+
+Finally, the data. Every production call produces a trace that is specific to India, specific to our merchants, and not available anywhere else. Without the evaluation loop, this is just storage. With it, it is a slow-but-compounding moat — the kind that takes 18 months to show up and then is very hard to dislodge. This is why closing the evaluation loop is high leverage: it is the unlock for everything else that depends on data.
+
+---
+
+# Closing Thought
+
+The voice-AI category is in the middle of a predictable transition. The model layer is commoditising. Real-time speech, SIP, tool use, structured output — all of these are becoming check-box features on every platform. The space where a narrow, opinionated, India-first team can win is the space above the model: orchestration that makes conversations auditable, quality tuning that makes them feel local, runtime tuning that makes them feel fast, and evaluation loops that make them get better over time.
+
+Those are not glamorous areas. They are the ones where the work compounds. What we have built in Breeze Buddy is a working implementation of all four layers — not as a prototype, but as a production system. The honest gaps (a proactive evaluation loop, context summarisation, more reusable flow primitives, a small exploratory bet on speech-native models) are well-scoped and worth investing in.
+
+Voice plus commerce in India is a systems problem before it is a model problem. That is the right problem to invest in, and it is the one we are closest to solving well.
+
+---
+
+# References
+
+The following internal documents dive into specific areas of the stack in more technical detail:
+
+- `agents-cloud.txt` — Agent's Cloud architecture overview: session isolation, one-pod-per-call, warm pools, concurrency-model analysis.
+- `docs/BREEZE_BUDDY_ARCHITECTURE.md` — full architecture reference, lead lifecycle, template engine internals, handler signatures.
+- `docs/LANGFUSE_AUTO_EVALUATION_AND_ALERTING.md` — the reactive evaluation loop, distributed locking, deduplication, time-window guarantees.
+- `docs/INTERRUPTION_CONTROL.md` — interruption strategies in detail.
+- `docs/README_WARM_TRANSFER.md` — warm transfer flow across Twilio, Plivo, and Exotel.
+- `docs/pipecat-upgrade-recommendations.md` — upcoming pipeline framework upgrades.
+
+Primary source files referenced in this brief:
+
+- `app/ai/voice/agents/breeze_buddy/agent/pipeline.py` — pipeline construction and turn-detection wiring.
+- `app/ai/voice/agents/breeze_buddy/template/types.py` — template schema, the source of truth for all template models.
+- `app/ai/voice/agents/breeze_buddy/template/transition.py` — the transition handler.
+- `app/ai/voice/agents/breeze_buddy/managers/calls.py` — call lifecycle state machine.
+- `app/ai/voice/agents/breeze_buddy/services/agent_router/client.py` — Smart Router client with circuit breaker for Agent's Cloud pod allocation.
+- `app/ai/voice/agents/breeze_buddy/services/telephony/` — Twilio, Plivo, and Exotel integrations behind the unified transport interface.
+- `app/ai/voice/agents/breeze_buddy/observability/tracing_setup.py` — OTEL root-span setup.
+- `app/services/langfuse/tasks/score_monitor/` — reactive evaluation monitoring loop.

@@ -1,0 +1,76 @@
+name: Publish docs
+
+# Renders the Quarto website on every push to main and deploys it to
+# GitHub Pages. No external services, no secrets needed — GitHub Pages
+# uses the built-in GITHUB_TOKEN.
+#
+# One-time setup (after pushing this repo to GitHub):
+#
+#   1. GitHub repo -> Settings -> Pages -> Build and deployment
+#      -> Source: "GitHub Actions"
+#      (Do NOT pick "Deploy from a branch" -- we deploy via Actions.)
+#
+#   2. Push this workflow file to main. First run creates the Pages
+#      deployment. After it succeeds, go back to Settings -> Pages
+#      and set "Custom domain" to: quarto.breezelabs.app
+#      (GitHub will write/verify the CNAME file that already exists
+#      in this repo.)  Enable "Enforce HTTPS".
+#
+#   3. In Cloudflare DNS for breezelabs.app, add a CNAME record:
+#        Name:  quarto
+#        Type:  CNAME
+#        Value: <github-username-or-org>.github.io
+#        Proxy: DNS only (grey cloud) -- let GitHub terminate TLS.
+#
+#   Within a few minutes, https://quarto.breezelabs.app is live.
+#
+# After setup, any push to main that changes a .qmd or _quarto.yml will
+# re-render and re-publish automatically in ~90 seconds.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+# Only one deploy at a time; newer pushes cancel in-flight renders but
+# not in-flight deploys.
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    name: Render Quarto site
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Quarto
+        uses: quarto-dev/quarto-actions/setup@v2
+
+      - name: Render
+        run: quarto render
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

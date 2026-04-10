@@ -1,0 +1,16 @@
+---
+title: "Breeze Labs — Technical Docs"
+subtitle: "Engineering briefs and architecture notes"
+---
+
+Technical documentation from the Breeze Labs engineering team.
+
+## Current briefs
+
+### [Breeze Buddy Voice Stack](voice-stack.qmd)
+
+A technical brief on building production voice AI for India. Covers the four capability layers where the real engineering depth sits: orchestration and flow control, India-specific conversational quality, runtime tuned for live sessions (Agent's Cloud, one-pod-per-call isolation), and evaluation and iteration loops. Written for founders and technical leadership.
+
+---
+
+*This site is a living document. Updates are published automatically on every push to the [`breezelabs/quarto-docs`](https://github.com/breezelabs/quarto-docs) repository.*

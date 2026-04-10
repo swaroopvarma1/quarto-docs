@@ -1,0 +1,20 @@
+# Quarto render output
+/_site/
+/.quarto/
+
+# Per-file render output (when rendering standalone, outside the project)
+/voice-stack.html
+/voice-stack_files/
+/index.html
+/index_files/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+**/*.quarto_ipynb
