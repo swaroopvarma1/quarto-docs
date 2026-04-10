@@ -287,6 +287,66 @@ Every step is the same regardless of which telephony provider you use. The provi
 
 Operators and product teams can override STT, TTS, VAD, and interruption configuration at runtime by inserting a lead with `is_playground=true` and a `configurations_override` payload. The override is applied at greeting synthesis and at pipeline build time. This is how we let merchants iterate on voice configuration without redeploying templates. It is a small feature with outsized effect on how quickly we can debug a conversation issue.
 
+## The call lifecycle state machine
+
+A lead moves through a small, deterministic state machine. This is the *outer* orchestration — how a lead becomes a call, becomes a conversation, becomes an outcome — wrapping the *inner* template flow (nodes, transitions, hooks) we covered above.
+
+```
+        +---------+
+        | BACKLOG |<----------------------------+
+        +----+----+                             |
+             |  cron pick + Redis lock           |
+             v                                   |
+     +---------------+                           |
+     |  pre-checks   |  fail-open per check      |
+     +-------+-------+                           |
+             |  pass                             |
+             v                                   |
+     +---------------+                           |
+     | acquire number|                           |
+     +-------+-------+                           |
+             |                                   |
+             v                                   |
+     +-------+-------+   init-failure  +---------+
+     | provider call |-----------------> retry w/
+     +-------+-------+                 | fallback
+             | connected                 +----+---+
+             v                                |
+     +---------------+                        |
+     |  PROCESSING   |<-----------------------+
+     +-------+-------+
+             |
+             v
+     +---------------+        BUSY / NO_ANSWER
+     | conversation  |-----------------+
+     +-------+-------+                 |
+             |                         v
+             v                  +----+----+
+     +---------------+          | BACKLOG |
+     |   FINISHED    |          | (retry) |
+     +---------------+          +---------+
+```
+
+A few reliability details worth calling out:
+
+- **Atomic Redis-backed lock on lead pick-up**, so the same lead is never picked by two pods simultaneously. A stuck-call watchdog cleans up leads that have been in `PROCESSING` too long.
+- **Per-check fail-open configuration.** Each external pre-check can be configured to `proceed` on external-API failure (fail-open) or `skip` (fail-closed). Fail-open is typical for low-risk lookups so the business does not stall when a third party goes down; regulated workflows default to fail-closed so compliance is never bypassed.
+- **Retry policy for BUSY / NO_ANSWER outcomes.** The lead is rescheduled with an exponential backoff and a bounded attempt count.
+- **Recording download and storage** is provider-specific and handled after the call ends, so the pipeline itself is never blocked on S3 or provider-API latency.
+- **End-of-conversation callbacks** run the transcription-export path, the reporting webhook with retry, and any template-specific post-call hooks.
+
+## Configuration layering
+
+The configuration model has three layers, each of which can override the one below:
+
+1. **Static config** from environment variables, loaded once at process start. This is the baseline — infrastructure endpoints, default providers, pool sizes, feature flags.
+2. **Dynamic config** from Redis (populated by DevCycle and similar feature-flag systems), accessed via async functions that fall back to defaults. This is what lets us tune provider choices, thresholds, and per-tenant behaviour without deploying.
+3. **Template-level config** embedded in each template, which is what operators and merchants edit. Template config overrides both of the above for any call using that template.
+
+On top of these three layers, the playground override path (above) lets us experiment on a single lead without touching any of them.
+
+This layering is the reason we can run many merchants on the same codebase with genuinely different voice behaviours — and is the reason new provider rollouts (a new Sarvam model, a new ElevenLabs voice) happen via a Redis flag change, not a deploy.
+
 ## Why this layer is a moat
 
 Because it turns conversation design from an engineering task into an operational task. A new merchant workflow that would take a week of prompt engineering and pull requests in a prompt-only system takes a day (sometimes an afternoon) with templates. The cost of shipping a variant drops by an order of magnitude — and that is where the sheet volume of the Indian enterprise voice market, across commerce, travel, collections, customer care, and regulated financial services, becomes unlockable instead of daunting.
@@ -359,13 +419,46 @@ Production audio is 8 kHz µ-law over mobile networks. The audio has telephony b
 - **Silero VAD parameters tuned for 8 kHz telephony**, with configurable confidence, start/stop seconds, and minimum volume. A Daily.co web call runs with different parameters than a Twilio call because the audio characteristics are different.
 - **Provider-level endpoint detection** tuned through configuration (Soniox `max_endpoint_delay_ms`, Deepgram endpointing milliseconds, Sarvam high VAD sensitivity for noisy lines).
 
+## Turn-taking: knowing when the user is done
+
+Turn detection — the decision about when a user has finished speaking and it is the bot's turn — is the single most influential knob for how natural a voice conversation feels. Get it wrong in one direction and the bot interrupts the user mid-sentence; get it wrong in the other direction and the user is left wondering if the bot even heard them. For Indian conversations the problem is harder than for clean English: speakers pause more naturally mid-sentence, switch languages mid-sentence, and frequently append confirmations or asides that a naive endpoint detector treats as new utterances.
+
+Turn detection is template-driven, with three modes a template can choose between per workflow:
+
+| Mode | How it decides the user is done | Strengths | Weaknesses |
+|---|---|---|---|
+| `stt_native` (default) | STT provider emits a semantic end-of-turn signal | Fastest; provider-optimised; works well with Soniox | Depends on provider endpoint quality |
+| `smart_turn` | Small on-device ONNX model (`SmartTurnAnalyzerV3`) analyses prosody and pauses | Handles natural hesitation well; provider-agnostic | Higher latency; some CPU cost |
+| `timeout` | Timer-based: wait N seconds after the last finalised transcript | Simple; predictable; any provider | Artificial delay on every turn |
+
+Internally, turn detection is not a single processor. It is a set of **start strategies** (what counts as "the user has started speaking?") and **stop strategies** (what counts as "the user is done?") attached to the user aggregator. Start strategies can be combined:
+
+- **VAD-based start.** Silero VAD detects speech energy. Fast, but false-fires on background noise.
+- **Transcription-based start.** Interim STT transcripts trigger the start. Catches soft speech that VAD would miss, at the cost of higher latency.
+- **Minimum-words start.** The user must speak at least N words before a "start" fires. Combined with the other two, this is how we suppress single-word backchannels — *"achha"*, *"hmm"*, *"theek hai"*, *"haan"* — that are extremely common in Indian conversational patterns and that a naive detector treats as interruptions.
+
+Stop strategies are mutually exclusive per mode:
+
+- **Accumulating-speech timeout.** Wait N seconds after the last finalised transcript. Used for `stt_native` (0.0 s — immediate) and `timeout` (configurable).
+- **Turn-analyser stop.** Feeds accumulated audio into the SmartTurn ONNX model, which predicts "user is done" from prosody. Used for `smart_turn`. When no external VAD is provided, SmartTurn auto-creates a Silero VAD with `stop_secs=0.2` as its trigger.
+
+Being able to choose a mode — and combine start/stop strategies — per workflow is what lets us say "for an address-collection flow where users speak slowly with pauses, use `smart_turn` with a minimum-words start" and "for a quick confirmation flow, use `stt_native` for minimum latency". A single-strategy product has to pick a compromise; a template-driven product does not.
+
+## Interruption handling: barge-in without chaos
+
+Interruption handling is how the bot distinguishes "the user is correcting me" from "the user just said *'achha'* while I was speaking". Three modes, template-level, overridable per node:
+
+- **`enabled`** — the bot stops mid-sentence when the user speaks and the LLM gets the interruption. This is the default human-feeling mode.
+- **`disabled_discard`** — user audio frames are dropped while the bot is speaking. Useful when the bot is reading critical information (terms, amounts, OTPs, account details) and a mid-sentence interruption would be a business hazard — particularly relevant for regulated workflows.
+- **`enabled` + `min_words`** — the user must speak at least N words before the interruption fires. This is the setting that stops backchannel interjections from hijacking the conversation mid-TTS, which is extremely common in Indian calls.
+
 ## Where frontier models cannot catch up fast
 
 Frontier models are trained predominantly on public web-scale data, which under-represents India-specific speech — and especially under-represents code-mixed, accented, noisy-telephony Indian speech. Every call we run produces a trace that nobody else has. That data does not become advantage on its own; it becomes advantage when the evaluation loop (next-but-one section) is closed.
 
 ---
 
-# Runtime Tuned for Live Sessions
+# Runtime: Agent's Cloud
 
 Voice is a real-time system, not a request/response system. The conversational latency budget is roughly 200 ms between *"user stops speaking"* and *"bot starts speaking"* to feel natural. That budget has to cover VAD detection, STT finalisation, LLM inference, TTS first byte, and the telephony round trip. Every layer must hit its number or the conversation feels broken.
 
@@ -467,28 +560,6 @@ What we get from this abstraction in production:
 
 This is the layer that, in practice, most merchants notice first. A voice product that cannot switch providers cleanly, cannot fail over during a provider outage, and cannot run the same template over phone and web with the same behaviour is a voice product that will have to be partially rewritten every few months. Ours does not.
 
-## Turn detection: three strategies, one template choice
-
-Turn detection is the single most influential knob for how natural a voice conversation feels. We support three strategies, and the template picks one per workflow:
-
-| Mode | How it decides the user is done | Strengths | Weaknesses |
-|---|---|---|---|
-| `stt_native` (default) | STT provider emits a semantic end-of-turn signal | Fastest; provider-optimised; works well with Soniox | Depends on provider endpoint quality |
-| `smart_turn` | Small on-device ONNX model (`SmartTurnAnalyzerV3`) analyses prosody and pauses | Handles natural hesitation well; provider-agnostic | Higher latency; some CPU cost |
-| `timeout` | Timer-based: wait N seconds after the last finalised transcript | Simple; predictable; any provider | Artificial delay on every turn |
-
-Being able to choose per workflow is what lets us say "for an address-collection flow where users speak slowly with pauses, use `smart_turn`" and "for a quick confirmation flow, use `stt_native` for minimum latency". A single-strategy product has to pick a compromise; a template-driven product does not.
-
-## Interruption control
-
-Interruption handling is how the bot distinguishes "the user is correcting me" from "the user just said 'uh-huh' while I was speaking". Three modes:
-
-- **`enabled`** — the bot stops mid-sentence when the user speaks, the interruption is forwarded to the LLM, and the LLM can respond. This is the default human-feeling mode.
-- **`disabled_discard`** — user audio frames are dropped while the bot is speaking. Useful when the bot is reading critical information (terms, amounts, OTPs) and an interruption would be a business hazard.
-- **`enabled` + `min_words`** — the user must speak at least N words before the interruption fires. This stops single-word backchannels (*"um", "okay", "hmm"*) from hijacking the conversation.
-
-Each of these is a template-level choice and can be overridden per node.
-
 ## Would switching language remove the need for any of this?
 
 A question we get occasionally: *if we rewrote the voice agent in Go or Rust, would we still need one-pod-per-call?* The answer is yes, with nuance.
@@ -549,89 +620,6 @@ The reactive loop tells us when something has gone wrong in production. The natu
 ## Why this investment compounds
 
 Every production call is private, India-specific, code-mixed, accented, noisy data. It cannot be bought and cannot be scraped. Closing the proactive loop is what turns this data into a compounding moat rather than passive storage: every merchant we serve makes every subsequent merchant's deployment more reliable, and over time the feedback loop is what turns today's engineering depth into a durable advantage.
-
----
-
-# Pipeline Deep Dive
-
-This section is for readers who want to go one level below the architecture diagrams without reading the code directly. It exists to make the point that the engineering depth in this stack is real — not by listing every class and method, but by showing the design choices that matter.
-
-## Turn detection strategies, in detail
-
-Turn detection is not a single processor. It is a set of **start strategies** (what counts as "the user has started speaking?") and **stop strategies** (what counts as "the user is done?") attached to the user aggregator.
-
-**Start strategies** we can combine:
-
-- **VAD-based start.** Silero VAD detects speech energy and emits an `is_speech` signal. Fast, but false-fires on background noise.
-- **Transcription-based start.** Interim STT transcripts trigger the start. This catches soft speech that VAD would miss, but has more latency.
-- **Minimum words start.** The user must speak at least N words before the start fires. Combined with one of the above, this is how we suppress single-word backchannels from triggering an interruption.
-
-**Stop strategies** are mutually exclusive per mode:
-
-- **Accumulating-speech timeout.** Wait N seconds after the last finalised transcript. Used for `stt_native` (0.0 s — immediate) and `timeout` (configurable).
-- **Turn-analyser stop.** Feeds accumulated audio into the SmartTurn ONNX model, which predicts "user is done" from prosody. Used for `smart_turn`. When no external VAD is provided, SmartTurn auto-creates a Silero VAD with `stop_secs=0.2` as its trigger signal.
-
-The reason we surface all of this is that naturalness of conversation is extremely sensitive to these parameters, and production voice products that get praised for "feeling human" all have some version of this machinery. Ours is template-driven, which is the part that lets us iterate on it per workflow.
-
-## The call lifecycle state machine
-
-A lead moves through a small, deterministic state machine. We describe it because it is the part of the system most operational staff interact with, and it is where a lot of reliability work lives.
-
-```
-        +---------+
-        | BACKLOG |<----------------------------+
-        +----+----+                             |
-             |  cron pick + Redis lock           |
-             v                                   |
-     +---------------+                           |
-     |  pre-checks   |  fail-open per check      |
-     +-------+-------+                           |
-             |  pass                             |
-             v                                   |
-     +---------------+                           |
-     | acquire number|                           |
-     +-------+-------+                           |
-             |                                   |
-             v                                   |
-     +-------+-------+   init-failure  +---------+
-     | provider call |-----------------> retry w/
-     +-------+-------+                 | fallback
-             | connected                 +----+---+
-             v                                |
-     +---------------+                        |
-     |  PROCESSING   |<-----------------------+
-     +-------+-------+
-             |
-             v
-     +---------------+        BUSY / NO_ANSWER
-     | conversation  |-----------------+
-     +-------+-------+                 |
-             |                         v
-             v                  +----+----+
-     +---------------+          | BACKLOG |
-     |   FINISHED    |          | (retry) |
-     +---------------+          +---------+
-```
-
-A few reliability details worth calling out:
-
-- **Atomic Redis-backed lock on lead pick-up**, so the same lead is never picked by two pods simultaneously. A stuck-call watchdog cleans up leads that have been in `PROCESSING` too long.
-- **Per-check fail-open configuration.** Each external pre-check can be configured to `proceed` on external-API failure (fail-open) or `skip` (fail-closed). Fail-open is typical for low-risk lookups so the business does not stall when a third party goes down; regulated workflows default to fail-closed so compliance is never bypassed.
-- **Retry policy for BUSY / NO_ANSWER outcomes.** The lead is rescheduled with an exponential backoff and a bounded attempt count.
-- **Recording download and storage** is provider-specific and handled after the call ends, so the pipeline itself is never blocked on S3 or provider-API latency.
-- **End-of-conversation callbacks** run the transcription-export path, the reporting webhook with retry, and any template-specific post-call hooks.
-
-## Configuration layering
-
-The configuration model has three layers, each of which can override the one below:
-
-1. **Static config** from environment variables, loaded once at process start. This is the baseline — infrastructure endpoints, default providers, pool sizes, feature flags.
-2. **Dynamic config** from Redis (populated by DevCycle and similar feature-flag systems), accessed via async functions that fall back to defaults. This is what lets us tune provider choices, thresholds, and per-tenant behaviour without deploying.
-3. **Template-level config** embedded in each template, which is what operators and merchants edit. Template config overrides both of the above for any call using that template.
-
-There is also a **playground override** path for runtime experimentation on a single lead, as described in the orchestration section.
-
-This layering is the reason we can run 200+ merchants on the same codebase with genuinely different voice behaviours — and is the reason new provider rollouts (a new Sarvam model, a new ElevenLabs voice) happen via a Redis flag change, not a deploy.
 
 ---
 
