@@ -21,7 +21,7 @@ execute:
   warning: false
 ---
 
-# Executive Summary {.unnumbered}
+# Executive summary {.unnumbered}
 
 The voice-AI market is past the novelty phase. Raw model access is commoditising quickly — every major platform now ships real-time speech models, SIP calling, tool use, and structured output. The durable advantage is no longer "we have the model." It is the system wrapped around the model: orchestration, conversational quality tuned for the real world, runtime tuned for live sessions, and feedback loops that turn every call into signal.
 
@@ -40,7 +40,7 @@ At the end we describe where we think investment should go next: closing the pro
 
 ---
 
-# The Problem: Production Voice AI in India
+# The problem: production voice AI in India
 
 ## Where we have chosen not to spend our time
 
@@ -57,7 +57,7 @@ The hard problems for production voice AI in India are not in the model layer. T
 - **Latency budget.** Voice conversation feels natural when the gap between "user stops" and "bot starts" is around 200 ms. A chat-class 1–2 second budget feels broken. That budget must be split across VAD, STT finalisation, LLM inference, TTS first byte, and the telephony leg. Every layer has to hit its number.
 - **Volume with variance.** India has enormous sheet volume for voice interactions — commerce, delivery coordination, travel and mobility, collections, customer care, and increasingly regulated financial services — but every merchant's workflow is slightly different. "One prompt fits all" never survives production.
 
-These are systems problems before they are model problems. Frontier models will keep improving, but they will not, on their own, solve multi-turn flow control, merchant-specific workflow templating, telephony resilience, interruption strategy, or evaluation infrastructure. Those layers are ours to build — and they are where the long-term advantage sits.
+We are not trying to build the best speech model. We are building a system that reliably orchestrates speech models — with deterministic control over workflows and context, robust multi-turn flow control, merchant-specific workflow templating, and optimised infrastructure for live sessions. Frontier models will keep improving, but they will not, on their own, solve these layers. Those are ours to build — and they are where the long-term advantage sits.
 
 ## The four layers where depth compounds
 
@@ -72,7 +72,7 @@ The rest of this document is organised around four capability layers. These are 
 
 ---
 
-# Architecture at a Glance
+# Architecture at a glance
 
 ## The layered view
 
@@ -122,7 +122,7 @@ A single call traverses six layers. Each layer is pluggable; templates select wh
 +--------------------------------------------------------------+
 ```
 
-Every live call is assigned its own Kubernetes pod. Templates are JSON rows in Postgres; operators edit them without touching code. Each provider at every layer (STT, TTS, LLM, transport) is a swap-in configuration — a template can choose Soniox + ElevenLabs + Twilio for one workflow and Sarvam + Cartesia + Exotel for another. The reasoning for the one-pod-per-call model is covered in detail in §[Runtime Tuned for Live Sessions]; the short version is that it is the only architecture we have found that gives deterministic latency under real production load.
+Every live call is assigned its own Kubernetes pod. Templates are JSON rows in Postgres; operators edit them without touching code. Each provider at every layer (STT, TTS, LLM, transport) is a swap-in configuration — a template can choose Soniox + ElevenLabs + Twilio for one workflow and Sarvam + Cartesia + Exotel for another. The reasoning for the one-pod-per-call model is covered in detail in the Runtime section below; the short version is that it is the only architecture we have found that gives deterministic latency under real production load.
 
 ## The pipeline frame flow
 
@@ -133,6 +133,9 @@ raw audio bytes
      |
      v
 [ transport.input ]          <- mu-law 8kHz for telephony, PCM 16kHz for Daily
+     |
+     v
+[ noise filter ]             <- optional AI Coustics (AIC), toggled per template
      |
      v
 [ STT service ]              <- Soniox | Deepgram | Sarvam | Google | OpenAI
@@ -156,15 +159,15 @@ raw audio bytes
 [ transport.output ]         <- mu-law 8kHz back to the telephony provider
 ```
 
-When the LLM emits a function call, control leaves the pipeline and enters the template transition handler (see §[Orchestration and Flow Control]). When a transition happens, the flow manager swaps the node config underneath the LLM context and the conversation continues. When the user idles past a configured threshold, the idle processor fires a callback that can retry a prompt, escalate, or end the call.
+When the LLM emits a function call, control leaves the pipeline and enters the template transition handler (see Orchestration and Flow Control below). When a transition happens, the flow manager swaps the node config underneath the LLM context and the conversation continues. When the user idles past a configured threshold, the idle processor fires a callback that can retry a prompt, escalate, or end the call.
 
 ::: {.callout-note}
-**Why this structure is load-bearing.** Each processor has a single responsibility, and frames flow in one direction. Adding a new capability (a new noise filter, a new turn strategy, a new transcription gate) means adding a processor, not rewriting the pipeline. Every voice AI product eventually grows this shape. We started here on purpose.
+**Why this structure is load-bearing.** Each processor has a single responsibility, and frames flow in one direction. Adding a new capability (a new turn strategy, a new transcription gate, a new audio processor) means adding a processor, not rewriting the pipeline. Every voice AI product eventually grows this shape. We started here on purpose.
 :::
 
 ---
 
-# Orchestration and Flow Control
+# Orchestration and flow control
 
 This is the layer that most clearly separates a production voice product from a demo. A state machine with clear transitions and side effects is what lets non-engineers ship new flows safely, lets us debug failures by reading logs, and lets us evolve behaviour without rewriting the pipeline every time.
 
@@ -307,6 +310,11 @@ A lead moves through a small, deterministic state machine. This is the *outer* o
      +-------+-------+                           |
              |                                   |
              v                                   |
+     +---------------+                           |
+     | allocate pod  |  warm pool -> voice-agent  |
+     +-------+-------+                           |
+             |                                   |
+             v                                   |
      +-------+-------+   init-failure  +---------+
      | provider call |-----------------> retry w/
      +-------+-------+                 | fallback
@@ -330,6 +338,7 @@ A lead moves through a small, deterministic state machine. This is the *outer* o
 A few reliability details worth calling out:
 
 - **Atomic Redis-backed lock on lead pick-up**, so the same lead is never picked by two pods simultaneously. A stuck-call watchdog cleans up leads that have been in `PROCESSING` too long.
+- **Pod allocation from the merchant warm pool.** The Smart Router assigns a dedicated pod (tagged `voice-agent-{N}`) before the provider call is initiated. If no warm pod is available, the call waits for one — never sharing a pod with another session.
 - **Per-check fail-open configuration.** Each external pre-check can be configured to `proceed` on external-API failure (fail-open) or `skip` (fail-closed). Fail-open is typical for low-risk lookups so the business does not stall when a third party goes down; regulated workflows default to fail-closed so compliance is never bypassed.
 - **Retry policy for BUSY / NO_ANSWER outcomes.** The lead is rescheduled with an exponential backoff and a bounded attempt count.
 - **Recording download and storage** is provider-specific and handled after the call ends, so the pipeline itself is never blocked on S3 or provider-API latency.
@@ -353,7 +362,7 @@ Because it turns conversation design from an engineering task into an operationa
 
 ---
 
-# India-Specific Conversational Quality
+# India-specific conversational quality
 
 This section answers the question we hear most often from people outside the voice space: *"If English STT and TTS are basically solved, what is left for you to do?"* The honest answer is: most of it.
 
@@ -382,7 +391,7 @@ Our approach is blended and explicit:
 The point is that **no single provider is "good enough" for every workflow in India**. Treating STT as a blended strategy — different providers for different templates, chosen at configuration time — is more expensive to operate than a single-vendor default, and produces meaningfully better outcomes in production.
 
 ::: {.callout-warning}
-**The honest take on Sarvam.** Sarvam is improving quickly and has genuine strength in code-mixed Indian speech and regional TTS. For our enterprise workflows today it is a selective tool, not a default. The same will be true for any single-vendor bet for the foreseeable future. The win is being able to choose per workflow, measure per workflow, and switch per workflow — not betting the product on a single provider's roadmap.
+**Why no single provider is the default.** Sarvam, ElevenLabs, Deepgram, and Soniox each win on different axes for different workflows. We use Sarvam selectively where it is strongest — and the same is true for every other provider. The full case for why a single-vendor bet does not work for India, and what the production evidence looks like, is covered in the standalone Sarvam section below.
 :::
 
 ## TTS: three providers, three different wins
@@ -468,7 +477,7 @@ But the per-turn latency budget is only half the story. The harder problem is ma
 
 Real-time audio has strict latency determinism requirements, and shared compute environments create fundamental problems: unpredictable latency spikes, CPU contention, memory pauses, fault propagation, and debugging complexity. We evaluated three concurrency models before settling on the one we run in production.
 
-### Scenario 1 — Many calls per pod, asyncio (the naive approach)
+### Scenario 1 — many calls per pod, asyncio (the naive approach)
 
 Handle multiple concurrent WebSocket streams in a single Python process using `asyncio`. This is the obvious starting point, and it is wrong for real-time voice.
 
@@ -480,7 +489,7 @@ Adding more CPU cores to the pod does not fix this: the event loop is single-thr
 **Analogy.** One teacher handling ten students. If one student asks a hard question, the teacher must focus on that student while the other nine wait silently. Adding more chairs does not give you more teachers.
 :::
 
-### Scenario 2 — Many calls per pod, subprocess per call
+### Scenario 2 — many calls per pod, subprocess per call
 
 Spawn a separate OS subprocess for each call inside the same pod. Each subprocess has its own interpreter and its own GIL, so multiple cores can actually be used. This is better than asyncio, and it is still not enough.
 
@@ -490,7 +499,7 @@ The reason is **container boundary enforcement**. Kubernetes enforces CPU limits
 **Analogy.** The classroom now has helper teachers (subprocesses), one per student. But the classroom has only one electricity breaker (the pod's CPU quota). When one helper turns on a heavy heater, the breaker trips for the whole room, and every student's lights flicker — even the ones who were doing nothing.
 :::
 
-### Scenario 3 — One call per pod (what we run)
+### Scenario 3 — one call per pod (what we run)
 
 Each call is assigned its own Kubernetes pod with dedicated CPU and memory (for example 1 vCPU / 1 GiB per pod, sized per merchant tier). This is the architecture we run in production. It gives us four properties that the other scenarios do not:
 
@@ -579,7 +588,7 @@ Put together, Agent's Cloud is the layer that turns a voice agent that works in 
 
 ---
 
-# Evaluation and Iteration Loops
+# Evaluation and iteration loops
 
 ## What we already run in production
 
@@ -623,7 +632,7 @@ Every production call is private, India-specific, code-mixed, accented, noisy da
 
 ---
 
-# Where to Invest
+# Where to invest
 
 The four-layer framing is also our investment framing. Each layer has a near-term improvement and a longer-term bet.
 
@@ -653,13 +662,78 @@ Finally, the data. Every production call produces a trace that is specific to In
 
 ---
 
-# 8 Distribution as an accelarant and how the Advantage grows
+# The Sarvam question
+
+*"Sarvam is building Indian speech models — doesn't that already solve this?"* This comes up in nearly every conversation about voice AI in India. Sarvam is India's most prominent AI lab — $41 million in Series A funding, roughly 4,000 H100 GPUs, selected under the IndiaAI Mission — and they are beginning to move beyond models into telephony and conversational products. The question is fair. Here is an honest assessment.
+
+## What Sarvam has built
+
+Sarvam's product portfolio spans three layers:
+
+- **Bulbul** (TTS) — text-to-speech in 11 Indian languages, currently on v3. This is their strongest product.
+- **Saaras** (STT) — speech-to-text for Indian languages, currently on v3. Far less adopted.
+- **Sarvam LLMs** — Sarvam-M (24B, fine-tuned on Mistral Small), Sarvam-30B and Sarvam-105B (MoE architecture, approximately 10.3B active parameters per inference, architecture heavily inspired by DeepSeek's MLA attention and MoE routing — to the point that the HuggingFace transformers team asked Sarvam to change their architecture naming).
+- **Indus** — a consumer chatbot, live in beta since February 2026.
+
+Bulbul TTS is the genuine bright spot. Hindi and Indian English synthesis is natural-sounding with authentic accents. Code-mixed speech handling (Hinglish in particular) is a real strength. Pricing is aggressive — approximately ₹15 per 10,000 words versus ElevenLabs at ~$0.50 per 10,000 words. We use Bulbul in production today for regional-language workflows, and Saarika (their code-mixed STT) selectively where it outperforms alternatives.
+
+## Where it breaks down in production
+
+The gap between demo quality and production reliability is significant. The evidence comes from our own experience, the broader developer community, and Sarvam's own documentation.
+
+**Latency.** Production voice agents using Sarvam TTS consistently report **2–3.5 seconds per turn**, with TTS as the dominant contributor. Pipeline optimisations help (streaming, sentence-level chunking, geographic proximity to Mumbai servers, using Sarvam-30B instead of 105B), but even optimised, Sarvam's latency is not competitive with ElevenLabs or Cartesia for real-time conversational voice.
+
+**Audio artifacts.** Bulbul randomly injects voices, tones, or extra words into TTS output and switches languages mid-utterance unpredictably. Sarvam's Bulbul v3 release acknowledges this under "Production-Grade Stability across Indian Languages," but the problem persists in production deployments. For enterprise workflows — especially regulated ones — unpredictable audio output is a compliance risk, not just a quality issue.
+
+**Uneven language quality.** Not all 11 languages are production-ready:
+
+| Quality tier | Languages | Status |
+|---|---|---|
+| Strong | Hindi, Indian English | Natural, competitive with global providers |
+| Adequate | Tamil, Telugu | Functional but not exceptional |
+| Weak | Malayalam, Gujarati, and others | Robotic, stuttery, not enterprise-ready |
+
+Enterprise voice operations that span India's linguistic diversity cannot accept this unevenness. A Bangalore Kannada delivery confirmation and a Kolkata Bengali collections call need the same quality bar.
+
+**STT (Saaras) is not competitive.** Most developers building voice agents with Sarvam TTS choose third-party STT — Deepgram Nova and Soniox for speed, accuracy, and code-mixed workflows, Whisper via Groq for cost. Saaras is chosen primarily when a full Sarvam stack is mandated by a client. Even Sarvam's own users do not use Sarvam for the full pipeline. For context, Soniox — our default STT provider — was built by a team of six engineers and already ships what is arguably the best real-time STT in the market, with strict multilingual hints, structured context grounding, and sub-second finalisation. That a team of that size can outperform Sarvam's STT with $41 million and 4,000 H100s behind it says more about focus and production feedback loops than about capital.
+
+**API reliability.** Sarvam's API experiences periodic downtime lasting hours. For real-time voice at enterprise scale, downtime means dropped revenue and broken SLAs. Multiple production teams report needing fallback providers specifically to handle Sarvam outages.
+
+## The LLM: a credible start, not frontier
+
+Sarvam-105B scored 11.2% on Humanity's Last Exam, ranking 46th out of 59 models. The developer community in India is increasingly vocal about a marketing-substance gap — airport billboards and government summit appearances have created expectations the products have not yet met. The "trained from scratch" framing has been challenged given the DeepSeek architecture reuse.
+
+None of this diminishes the strategic importance of sovereign AI for India, and building foundation models on a $41 million budget is genuinely hard. But the LLM is not the reason to choose or avoid Sarvam for enterprise voice — and it is not yet competitive with frontier models for the reasoning and tool-calling tasks that production voice agents require.
+
+## The open-source frontier
+
+The landscape that makes Sarvam's TTS position valuable also makes it fragile. Open-source TTS is improving rapidly:
+
+| Model | Latency | Key property |
+|---|---|---|
+| **Qwen3-TTS** | 97 ms TTFA | Open source, 10+ languages |
+| **Voxtral (Mistral)** | 90 ms TTFA | Open weights, runs on 3 GB RAM |
+| **Kokoro** | Fast (self-hosted) | 82M parameters, fully open |
+
+None of these have native Indian language support at Sarvam's quality today. But the gap is closing. Fine-tuning Kokoro or Qwen3-TTS on Indian language data is a well-understood project — the community has already identified it as the obvious next step — and the result would be a self-hostable, low-latency Indian TTS model that eliminates Sarvam's two biggest pain points (latency and reliability) by running on controlled infrastructure.
+
+This is the path we described in the specialised small models investment area: fine-tuned models trained on production traces, for bounded tasks, at a fraction of the latency and cost of general-purpose providers. A pluggable template system means a new fine-tuned model slots in alongside Sarvam, ElevenLabs, and Cartesia with a configuration change — no orchestration rewrite required.
+
+## Where this leaves us
+
+Sarvam is a provider we use, not a platform that replaces what we have built. Their Bulbul TTS is genuinely strong for Hindi and Indian English; their STT and LLM are not yet competitive; their production reliability is not yet enterprise-grade. They are moving up the stack into telephony and conversational products, but the orchestration, runtime, and evaluation layers that turn a model into a reliable enterprise voice product are a different kind of engineering — learned from a different kind of production exposure.
+
+The answer to *"why not just Sarvam?"* is the same as the answer to *"why not just ElevenLabs?"* or *"why not just Deepgram?"* — because no single provider wins every workflow in India, and the durable value is the system that orchestrates all of them.
+
+---
+
+# Distribution as an accelerant, and how the advantage grows
 
 This section is not about the voice stack. It is about what happens when the voice stack meets distribution — and why the combination matters more than either part alone.
 
 ---
 
-## 8.1 Four layers, and why having all four matters
+## Four layers, and why having all four matters
 
 The previous sections describe four capability layers: orchestration and flow control, India-specific conversational quality, runtime tuned for live sessions, and evaluation and iteration loops. Each of these is, on its own, a time lead — not a structural moat. Any well-funded team with strong engineers can build any one of them in six to twelve months. The claim we are making is narrower and more specific: **having all four layers integrated, in production, serving real enterprise workflows across multiple verticals, is a compounding position that becomes structurally harder to replicate the longer it runs.**
 
@@ -667,7 +741,7 @@ That claim requires evidence. This section provides it — first by examining wh
 
 ---
 
-## 8.2 What the competitive landscape actually looks like
+## What the competitive landscape actually looks like
 
 We have studied the publicly available information — product pages, technical documentation, GitHub repositories, funding announcements, customer case studies, pricing structures, and third-party comparisons — for the companies operating in the India voice AI space. Here is an honest, layer-by-layer assessment.
 
@@ -679,7 +753,7 @@ Bolna is the closest direct competitor and the one we take most seriously. YC-ba
 
 **Layer 2 — India-specific conversational quality:** This is Bolna's strongest layer. They claim sub-500ms latency, support for 10+ Indian languages and 50+ accents, and intelligent model routing per call ([source](https://www.ycombinator.com/companies/bolna-ai)). Their YC page describes India-specific routing that selects the optimal model blend based on language, region, and use case — conceptually similar to our blended STT/TTS approach. They also use cost-efficiency techniques like pre-recorded inserts for common utterances and smaller models where possible. We should assume this layer is competitive.
 
-**Layer 3 — Runtime:** Bolna's pricing page indicates a cap of 10 concurrent calls on all paid plans below enterprise, with calls beyond that limit queued ([source](https://blog.dograh.com/bolna-ai-pricing-breakdown-and-how-open-source-saves-70/)). Their open-source repository shows a Docker-based setup using asyncio ([source](https://github.com/bolna-ai/bolna)) — which, as we discussed in §5.1, creates deterministic latency problems under real concurrency. Whether the hosted product uses a different architecture is not publicly documented. The 200,000 daily calls figure suggests they have solved scale at the infrastructure level, though the concurrency model and isolation strategy are not described. We cannot confirm one-pod-per-call isolation, merchant-specific warm pools, or the kind of circuit-breakered runtime we run.
+**Layer 3 — Runtime:** Bolna's pricing page indicates a cap of 10 concurrent calls on all paid plans below enterprise, with calls beyond that limit queued ([source](https://blog.dograh.com/bolna-ai-pricing-breakdown-and-how-open-source-saves-70/)). Their open-source repository shows a Docker-based setup using asyncio ([source](https://github.com/bolna-ai/bolna)) — which, as we discussed in the Runtime section, creates deterministic latency problems under real concurrency. Whether the hosted product uses a different architecture is not publicly documented. The 200,000 daily calls figure suggests they have solved scale at the infrastructure level, though the concurrency model and isolation strategy are not described. We cannot confirm one-pod-per-call isolation, merchant-specific warm pools, or the kind of circuit-breakered runtime we run.
 
 **Layer 4 — Evaluation:** Bolna's platform page mentions analytics and a dashboard. There is no published evidence of LLM-as-judge scoring, automated alerting, node traversal tracking, or a systematic evaluation loop. Their open-source repository does not include evaluation infrastructure.
 
@@ -731,11 +805,11 @@ ElevenLabs ($3.3B valuation) is the infrastructure-layer threat. They now offer 
 
 **Layer 4 — Evaluation:** They ship agent simulations, A/B testing, and built-in analytics ([source](https://elevenlabs.io/agents)). This is more evaluation infrastructure than any India-focused competitor offers out of the box.
 
-**Summary:** ElevenLabs is the most credible long-term threat. They have the capital, the model quality, and the platform ambition. It is worth noting that ElevenLabs is also a provider we use — their TTS is our default for English-first and English+Hindi workflows, as described in §4.3. This is not a contradiction; it is the nature of the layer we operate in. We are not competing with ElevenLabs on TTS quality — we are building the system around the model that turns a good voice into a reliable, auditable, enterprise-grade conversation. What ElevenLabs lacks is India-specific operational depth — the kind that comes from running thousands of production calls across Indian telephony networks, handling Exotel's webhook quirks, managing Truecaller verification, dealing with spam-flagged numbers, and debugging code-mixed conversations in noisy kirana-store environments. They are building from the model layer up; we are building from the operational layer down. The question is which direction closes the gap faster — and whether, as ElevenLabs' platform matures, the value of the operational layer above it increases (because more enterprises need someone to run it for them) or decreases (because the platform makes it easy enough to self-serve). We believe the former, especially for regulated and high-volume enterprise workflows.
+**Summary:** ElevenLabs is the most credible long-term threat. They have the capital, the model quality, and the platform ambition. It is worth noting that ElevenLabs is also a provider we use — their TTS is our default for English-first and English+Hindi workflows, as described in the TTS section. This is not a contradiction; it is the nature of the layer we operate in. We are not competing with ElevenLabs on TTS quality — we are building the system around the model that turns a good voice into a reliable, auditable, enterprise-grade conversation. What ElevenLabs lacks is India-specific operational depth — the kind that comes from running thousands of production calls across Indian telephony networks, handling Exotel's webhook quirks, managing Truecaller verification, dealing with spam-flagged numbers, and debugging code-mixed conversations in noisy kirana-store environments. They are building from the model layer up; we are building from the operational layer down. The question is which direction closes the gap faster — and whether, as ElevenLabs' platform matures, the value of the operational layer above it increases (because more enterprises need someone to run it for them) or decreases (because the platform makes it easy enough to self-serve). We believe the former, especially for regulated and high-volume enterprise workflows.
 
 ---
 
-## 8.3 The gap: no competitor has all four layers in production
+## The gap: no competitor has all four layers in production
 
 The pattern across the competitive landscape is consistent. Every player is strong on one or two layers but appear to be  weak or absent on the others:
 
@@ -751,7 +825,7 @@ This is not a claim that we are better than every competitor on every dimension.
 
 ---
 
-## 8.4 Distribution is the accelerant
+## Distribution is the accelerant
 
 The four-layer advantage described above is a time lead. Left alone, it erodes. Bolna has $6.3M and YC's network. SquadStack has $25M and 500 employees. ElevenLabs has $3.3B and the best voice model in the world. We cannot out-fund any of them. We cannot out-hire SquadStack. We cannot out-research ElevenLabs.
 
@@ -759,15 +833,15 @@ What we have is **distribution that none of them can replicate in the near term*
 
 The question is not whether we have distribution. It is whether we use it. Here is how each layer compounds when distribution feeds it.
 
-### Orchestration → Template library
+### Orchestration → template library
 
 Every enterprise we onboard through Juspay brings a workflow we have not built before. Redbus needed operator verification. Freshbus needed post-journey feedback. Namma Yatri needs ride coordination. Each deployment forces us to build, test, and refine a template for that workflow family — and to extract reusable primitives (address collection, payment confirmation, escalation handoff, OTP readback) that make the next template faster to build.
 
 After twenty enterprises across five verticals, we do not just have a template system — we have a template library. A new enterprise prospect in travel does not wait three weeks for a custom build. They get a composition of proven primitives, configured in a day. A competitor at template five is still writing each one from scratch. This is a deployment speed advantage that widens with every vertical we enter, and it is the kind of advantage that enterprise procurement teams can feel in the sales cycle even if they cannot articulate the architecture underneath.
 
-The critical dependency is the reusable-primitives work described in §8.3. Without it, every template stays bespoke and template fifty is not meaningfully faster to build than template five.
+The critical dependency is the reusable-primitives work described in the Orchestration Depth section under Where to Invest. Without it, every template stays bespoke and template fifty is not meaningfully faster to build than template five.
 
-### India-specific quality → Data-backed provider routing
+### India-specific quality → data-backed provider routing
 
 Every production call generates a trace with STT confidence scores, transcription accuracy, TTS naturalness signals, and business outcome data. Across a hundred merchants in different cities, industries, and customer demographics, these traces become a lookup table: which provider works best for which language, region, noise profile, and workflow type.
 
@@ -775,7 +849,7 @@ Today this knowledge lives in engineering judgment. With distribution-driven vol
 
 The critical dependency is the evaluation loop. Without systematic measurement of provider performance per workflow, the traces are storage, not signal.
 
-### Runtime → Operational hardening
+### Runtime → operational hardening
 
 Runtime advantages compound differently — not through data, but through production scars. Every incident, every provider outage, every edge case we survive teaches Agent's Cloud something: circuit breaker thresholds get tuned from real failure patterns, warm pool sizing gets calibrated from actual merchant concurrency curves, zombie-pod cleanup catches failure modes we did not anticipate, and per-provider failover handles the specific quirks of Exotel's webhook format or Plivo's conference bridging.
 
@@ -783,7 +857,7 @@ After running a hundred thousand calls through Agent's Cloud, the system has sur
 
 The critical dependency is volume. A runtime that handles 139 merchants, most on the free tier, does not generate enough production stress to harden meaningfully faster than a competitor at comparable scale. The Juspay enterprise pipeline — ten enterprises doing a thousand or more calls per day each — would generate more hardening signal in a month than a hundred SMBs generate in a year.
 
-### Evaluation → Model intelligence
+### Evaluation → model intelligence
 
 This is the layer with the highest long-term leverage and the most work still to be done.
 
@@ -793,11 +867,11 @@ With the evaluation loop closed, the sequence is: traces get scored by LLM-as-ju
 
 This is the classic data flywheel, and it is the mechanism by which a time lead becomes a structural moat. After eighteen months of this loop running at enterprise scale, a competitor is not just behind on engineering — they are behind on data, and data is the one thing you cannot shortcut by hiring more engineers.
 
-The critical dependency is closing the proactive evaluation loop described in §6.2. Every week it stays unbuilt is a week the flywheel is not turning.
+The critical dependency is closing the proactive evaluation loop described in the Evaluation section. Every week it stays unbuilt is a week the flywheel is not turning.
 
 ---
 
-## 8.5 What opens up beyond today's workflows
+## What opens up beyond today's workflows
 
 The product surface described in this document — outbound and inbound voice automation for commerce, travel, and mobility — is where we are today. It is not where the compounded stack ends up. As the four layers strengthen through distribution-driven volume, specific expansion paths become viable that are not accessible to a team with fewer layers in place or less production depth. This section describes those paths and explains which layers unlock each one.
 
@@ -812,7 +886,7 @@ A prompt-driven voice agent cannot satisfy these requirements. A node-based stat
 - **Auditability.** Our node-traversal tracking — every node entry and exit, with IST timestamps, duration, the function that triggered the transition, and the arguments the LLM supplied — produces the audit trail that RBI and IRDAI auditors need. A conversation that went wrong can be reconstructed step by step, not inferred from a transcript.
 - **Determinism.** The template state machine guarantees that mandatory disclosure steps (required by IRDAI for insurance sales calls, by RBI for collections) cannot be skipped by the LLM. A mandatory node with no skip-transition means the conversation cannot proceed without completing the disclosure. A prompt-only system has no such guarantee.
 - **Isolation.** One-pod-per-call means a compliance event (a crash, a recording failure, an audit query) is traceable to a single call with a single set of logs, a single resource boundary, and a single recording. In a shared-pod architecture, reconstructing which call caused which behaviour under which conditions is a forensic exercise.
-- **Consent management.** The template pre-check system (§7.2) already supports per-check fail-open/fail-closed configuration. Extending this to consent verification — checking against a Digital Consent Registry before dialing, logging consent status per call — is a configuration change, not an architecture change.
+- **Consent management.** The template pre-check system (described in the call lifecycle section) already supports per-check fail-open/fail-closed configuration. Extending this to consent verification — checking against a Digital Consent Registry before dialing, logging consent status per call — is a configuration change, not an architecture change.
 
 The Juspay relationship is the distribution lever here. Juspay already processes payments for banks, NBFCs, and insurance companies. These are organisations that trust the Juspay brand for handling regulated financial infrastructure. A voice automation layer from the same stable, built with the compliance properties described above, faces a meaningfully shorter sales cycle than a voice AI startup asking for a cold POC.
 
@@ -836,7 +910,7 @@ The most interesting expansion is the one that leverages the template state mach
 
 Each of these interactions currently lives in a separate system. The merchant manages them through different dashboards, different vendors, and different data stores. The customer repeats their order number every time.
 
-The orchestration layer we have built — nodes, transitions, hooks, global functions, context state — does not inherently care whether the next node is a voice turn or a WhatsApp message or an API call to a logistics provider. The state machine is transport-agnostic; the transport layer (§5.4) already abstracts between telephony and web. Extending it to WhatsApp (via a message processor that sits alongside the voice pipeline) and to webhook-driven logistics updates is an engineering project with well-defined boundaries, not a research problem.
+The orchestration layer we have built — nodes, transitions, hooks, global functions, context state — does not inherently care whether the next node is a voice turn or a WhatsApp message or an API call to a logistics provider. The state machine is transport-agnostic; the transport layer already abstracts between telephony and web. Extending it to WhatsApp (via a message processor that sits alongside the voice pipeline) and to webhook-driven logistics updates is an engineering project with well-defined boundaries, not a research problem.
 
 What makes this valuable is the context continuity. A customer who confirmed their order on call one should not have to re-identify on call three. The node-traversal history, the outcome metadata, and the lead state carry forward across the entire journey. The template system becomes a journey orchestrator, and voice becomes the anchor interaction — the high-trust, high-bandwidth channel that the asynchronous channels orbit around.
 
@@ -856,7 +930,7 @@ None of these expansions require a fundamentally different product. They require
 
 ---
 
-## 8.6 What comes next
+## What comes next
 
 The competitive landscape described above is moving quickly. That is not a cause for alarm — it is validation. When Bolna raises $6.3 million, when SquadStack claims a Turing Test, when ElevenLabs builds an India page, when BiteSpeed crosses $5M ARR on voice — each of these is evidence that the market we chose is real and large. The race to serve it is well under way.
 
@@ -864,7 +938,7 @@ Our position in that race is specific: we have the deepest integrated stack, and
 
 Three engineering investments close that loop. They are worth naming because they are the natural next priorities after the work described in the rest of this document:
 
-**Close the proactive evaluation loop.** The reactive loop is running — LLM-as-judge scoring, Slack alerting, recording URLs. The traces are accumulating. What is missing is the replay harness, the A/B framework, and the regression gates that turn traces into systematic improvement. This is well-scoped work with clear deliverables, and it is the single project that unlocks the data flywheel described in §10.4. Without it, every call is raw material we are not processing. With it, every call makes the next deployment better than the last one.
+**Close the proactive evaluation loop.** The reactive loop is running — LLM-as-judge scoring, Slack alerting, recording URLs. The traces are accumulating. What is missing is the replay harness, the A/B framework, and the regression gates that turn traces into systematic improvement. This is well-scoped work with clear deliverables, and it is the single project that unlocks the data flywheel described in the Evaluation → Model Intelligence section above. Without it, every call is raw material we are not processing. With it, every call makes the next deployment better than the last one.
 
 **Extract reusable flow primitives.** The template system is flexible enough to express any workflow, but every new merchant still builds from scratch. Address collection, payment confirmation, OTP readback, escalation handoff — these patterns repeat across verticals. Extracting them into composable, tested primitives is what converts a template system into a template platform. It is also what makes deployment speed compound: template fifty should take an afternoon, not a week.
 
